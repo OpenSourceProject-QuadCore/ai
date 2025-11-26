@@ -6,12 +6,21 @@ import pandas as pd
 import asyncio
 from datetime import datetime
 import uvicorn
+import argparse
 
 from bus_tracker import BusTracker
 from bus_predictor import BusArrivalPredictor
 from data_preprocessing import BusDataPreprocessor
 
+# --------------------------------------------------------
+# 전역 변수
+# --------------------------------------------------------
 app = FastAPI(title="구미 버스 실시간 추적 API")
+tracker: Optional[BusTracker] = None
+predictor: Optional[BusArrivalPredictor] = None
+historical_data: Optional[pd.DataFrame] = None
+SIMULATION_MODE = False  # 시뮬레이션 모드 플래그
+
 
 # --------------------------------------------------------
 # CORS
@@ -24,19 +33,12 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# --------------------------------------------------------
-# 글로벌 객체
-# --------------------------------------------------------
-tracker: Optional[BusTracker] = None
-predictor: Optional[BusArrivalPredictor] = None
-historical_data: Optional[pd.DataFrame] = None
-
 
 # --------------------------------------------------------
 # Request Models
 # --------------------------------------------------------
 class BusArrivalData(BaseModel):
-    collection_time: str   # 반드시 서버에 전달됨
+    collection_time: str   # ISO format string
     weekday: str
     time_slot: str
     weather: str
@@ -62,6 +64,7 @@ class BusInfoResponse(BaseModel):
     routeno: str
     nodeid: str
     nodenm: str
+    slot: int
     arrprevstationcnt: int
     arrtime: int
     display_minutes: int
@@ -79,7 +82,10 @@ class BusInfoResponse(BaseModel):
 async def startup_event():
     global tracker, predictor, historical_data
 
+    print("=" * 60)
     print("=== 서버 초기화 시작 ===")
+    print(f"모드: {'시뮬레이션' if SIMULATION_MODE else '실시간'}")
+    print("=" * 60)
 
     # -------------------------
     # 모델 로드
@@ -90,23 +96,36 @@ async def startup_event():
         print("✓ 예측 모델 로드 성공")
     except Exception as e:
         print(f"⚠ 모델 로드 실패: {e}")
+        print("  예측 기능 없이 실행됩니다.")
         predictor = None
 
     # -------------------------
-    # 과거 데이터 로드
+    # 과거 데이터 로드 (fallback용)
     # -------------------------
     try:
-        pre = BusDataPreprocessor("bus_arrivals.csv")
-        historical_data = pre.load_data()
-        print(f"✓ 과거 데이터 로드 ({len(historical_data)} rows)")
+        # 전처리된 데이터가 있으면 사용
+        processed_path = "data/processed_bus_arrivals.csv"
+        if pd.io.common.file_exists(processed_path):
+            historical_data = pd.read_csv(processed_path)
+            print(f"✓ 전처리된 과거 데이터 로드 ({len(historical_data):,} rows)")
+        else:
+            # 없으면 원본 데이터 로드
+            pre = BusDataPreprocessor("bus_arrivals.csv")
+            historical_data = pre.load_data()
+            print(f"✓ 원본 과거 데이터 로드 ({len(historical_data):,} rows)")
     except Exception as e:
         print(f"⚠ 과거 데이터 로드 실패: {e}")
+        print("  Fallback 기능이 제한됩니다.")
         historical_data = None
 
     # -------------------------
     # BusTracker 초기화
     # -------------------------
-    tracker = BusTracker(predictor=predictor, historical_data=historical_data)
+    tracker = BusTracker(
+        predictor=predictor, 
+        historical_data=historical_data,
+        simulation_mode=SIMULATION_MODE
+    )
     print("✓ BusTracker 초기화 완료")
 
     # -------------------------
@@ -115,29 +134,38 @@ async def startup_event():
     asyncio.create_task(background_task_loop())
     print("✓ 백그라운드 작업 시작")
 
+    print("=" * 60)
     print("=== 초기화 완료 ===")
+    print("=" * 60)
 
 
 # --------------------------------------------------------
 # 백그라운드 작업
-# collection_time 기준을 사용하든 현재 시각(now) 기준을 사용하든
-# 설계에 맞게 BusTracker 내부 메서드가 이미 정리되어 있음.
 # --------------------------------------------------------
 async def background_task_loop():
+    """
+    주기적으로 버스 상태 업데이트
+    - 오래된 버스 PREDICTED 전환
+    - PREDICTED 버스 재예측
+    - 도착한 버스 제거
+    """
     while True:
-
         if tracker is None:
-            print("⚠ tracker=None, 초기화 대기 중")
             await asyncio.sleep(2)
             continue
 
         try:
+            # 180초 동안 업데이트 없으면 PREDICTED로 전환
             tracker.check_lost_buses(timeout_seconds=180)
+            
+            # PREDICTED 버스 재예측
             tracker.update_predictions()
+            
+            # 도착 임박 버스 제거 (10초 이하)
             tracker.remove_arrived_buses(threshold_seconds=10)
 
         except Exception as e:
-            print(f"⚠ 백그라운드 오류: {e}")
+            print(f"⚠ 백그라운드 작업 오류: {e}")
 
         await asyncio.sleep(10)
 
@@ -152,35 +180,60 @@ async def receive_bus_data(data: BusArrivalData):
 
     bus = data.dict()
 
-    # collection_time → datetime 변환
+    # collection_time 파싱
     try:
         bus["collection_time"] = datetime.fromisoformat(bus["collection_time"])
-    except Exception:
-        print("⚠ collection_time 파싱 실패 → now()로 대체")
-        bus["collection_time"] = datetime.now()
+    except Exception as e:
+        if SIMULATION_MODE:
+            # 시뮬레이션 모드에서는 반드시 파싱되어야 함
+            raise HTTPException(400, f"collection_time 파싱 실패: {e}")
+        else:
+            # 실시간 모드에서는 현재 시간 사용
+            print(f"⚠ collection_time 파싱 실패 → now()로 대체: {e}")
+            bus["collection_time"] = datetime.now()
 
+    # 데이터 처리
     tracker.process_new_data(bus)
     return {"status": "success", "message": "ok"}
 
 
 # --------------------------------------------------------
-# POST: 여러 개 수신
+# POST: 여러 개 수신 (배치)
 # --------------------------------------------------------
 @app.post("/api/bus-arrival/batch")
 async def receive_bus_data_batch(data_list: List[BusArrivalData]):
     if tracker is None:
         raise HTTPException(500, "트래커 미초기화")
 
+    processed_count = 0
+    error_count = 0
+
     for d in data_list:
-        bus = d.dict()
         try:
-            bus["collection_time"] = datetime.fromisoformat(bus["collection_time"])
-        except:
-            bus["collection_time"] = datetime.now()
+            bus = d.dict()
+            
+            # collection_time 파싱
+            try:
+                bus["collection_time"] = datetime.fromisoformat(bus["collection_time"])
+            except Exception as e:
+                if SIMULATION_MODE:
+                    print(f"⚠ Batch 내 collection_time 파싱 실패 (스킵): {e}")
+                    error_count += 1
+                    continue
+                else:
+                    bus["collection_time"] = datetime.now()
 
-        tracker.process_new_data(bus)
+            tracker.process_new_data(bus)
+            processed_count += 1
+            
+        except Exception as e:
+            print(f"⚠ Batch 처리 오류: {e}")
+            error_count += 1
 
-    return {"status": "success", "message": f"{len(data_list)} processed"}
+    return {
+        "status": "success", 
+        "message": f"{processed_count} processed, {error_count} errors"
+    }
 
 
 # --------------------------------------------------------
@@ -244,19 +297,55 @@ async def get_status():
 
     return {
         "status": "running",
+        "mode": "simulation" if SIMULATION_MODE else "realtime",
         "total_buses": len(buses),
         "active_buses": active,
         "predicted_buses": predicted,
         "predictor_loaded": predictor is not None,
         "historical_data_loaded": historical_data is not None,
+        "current_time": tracker._get_current_time().isoformat() if tracker else None,
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.get("/")
 async def root():
-    return {"message": "Gumi Real-time Bus API", "docs": "/docs"}
+    return {
+        "message": "Gumi Real-time Bus Tracking API",
+        "mode": "simulation" if SIMULATION_MODE else "realtime",
+        "docs": "/docs"
+    }
+
+
+# --------------------------------------------------------
+# CLI 진입점
+# --------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="구미 버스 추적 서버")
+    parser.add_argument("--simulation", action="store_true",
+                       help="시뮬레이션 모드로 실행 (collection_time 사용)")
+    parser.add_argument("--host", default="0.0.0.0", help="서버 호스트")
+    parser.add_argument("--port", type=int, default=8000, help="서버 포트")
+    parser.add_argument("--reload", action="store_true", help="자동 리로드 (개발용)")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    args = parse_args()
+    SIMULATION_MODE = args.simulation
+    
+    print("\n" + "=" * 60)
+    if SIMULATION_MODE:
+        print("🎬 시뮬레이션 모드로 서버 시작")
+        print("   collection_time을 기준으로 동작합니다")
+    else:
+        print("🔴 실시간 모드로 서버 시작")
+        print("   현재 시각을 기준으로 동작합니다")
+    print("=" * 60 + "\n")
+    
+    uvicorn.run(
+        "main:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload
+    )

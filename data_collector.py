@@ -19,6 +19,7 @@ class BusDataCollector:
         self.api_url = api_url
         self.last_position = 0            # 마지막으로 읽은 CSV row index
         self.last_mtime = None            # 수정 시간
+        self.last_check_time = 0          # 마지막 체크 시간 (동일 초 중복 방지)
         
 
     # ------------------------------------------------------
@@ -31,12 +32,16 @@ class BusDataCollector:
 
         try:
             mtime = os.path.getmtime(self.csv_path)
+            current_check = time.time()
 
-            # 파일이 변경되지 않았다면 읽지 않음
-            if self.last_mtime is not None and mtime == self.last_mtime:
+            # 파일이 변경되지 않았고 최근에 체크했다면 스킵
+            if (self.last_mtime is not None and 
+                mtime == self.last_mtime and 
+                current_check - self.last_check_time < 1.0):
                 return []
 
             self.last_mtime = mtime
+            self.last_check_time = current_check
 
             # 전체 CSV 읽기
             df = pd.read_csv(self.csv_path)
@@ -82,17 +87,22 @@ class BusDataCollector:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self.api_url}/api/bus-arrival/batch",
-                    json=data
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
 
                     if resp.status == 200:
                         result = await resp.json()
                         print(f"✓ {len(data)}건 전송: {result.get('message')}")
                     else:
-                        print(f"✗ API 상태코드 오류: {resp.status}")
+                        text = await resp.text()
+                        print(f"✗ API 상태코드 오류: {resp.status}, {text[:200]}")
 
         except aiohttp.ClientError as e:
             print(f"✗ API 연결 오류: {e}")
+
+        except asyncio.TimeoutError:
+            print(f"✗ API 타임아웃")
 
         except Exception as e:
             print(f"✗ 전송 오류: {e}")
@@ -114,7 +124,7 @@ class BusDataCollector:
                     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 새 데이터: {len(new_data)}개")
                     await self.send_to_api(new_data)
                 else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 새 데이터 없음")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 새 데이터 없음", end='\r')
 
             except Exception as e:
                 print(f"실시간 루프 오류: {e}")
@@ -128,6 +138,10 @@ class BusDataCollector:
 async def simulate_realtime_data(csv_path="data/bus_arrivals.csv",
                                  api_url="http://localhost:8000",
                                  speed_multiplier=60):
+    """
+    시뮬레이션 모드: collection_time을 유지하여 전송
+    서버가 시뮬레이션 모드로 실행되어야 함
+    """
     if not os.path.exists(csv_path):
         print(f"CSV 없음: {csv_path}")
         return
@@ -136,8 +150,10 @@ async def simulate_realtime_data(csv_path="data/bus_arrivals.csv",
     df['collection_time'] = pd.to_datetime(df['collection_time'])
     df = df.sort_values('collection_time')
 
-    print(f"=== 시뮬레이션 시작 ({speed_multiplier}x) ===")
+    print(f"=== 시뮬레이션 시작 ({speed_multiplier}x 속도) ===")
     print(f"총 {len(df)} rows")
+    print(f"시작 시각: {df['collection_time'].iloc[0]}")
+    print(f"종료 시각: {df['collection_time'].iloc[-1]}")
 
     start_time = df['collection_time'].iloc[0]
     idx = 0
@@ -152,7 +168,7 @@ async def simulate_realtime_data(csv_path="data/bus_arrivals.csv",
             while idx < len(df) and df['collection_time'].iloc[idx] == cur_time:
                 row = df.iloc[idx].copy()
 
-                # Timestamp 직렬화
+                # Timestamp 직렬화 (ISO format 유지)
                 row['collection_time'] = row['collection_time'].isoformat()
 
                 # NaN -> None
@@ -161,16 +177,23 @@ async def simulate_realtime_data(csv_path="data/bus_arrivals.csv",
                 batch.append(row.to_dict())
                 idx += 1
 
-            # API 전송
+            # API 전송 (시뮬레이션 모드 플래그 포함)
             try:
                 async with session.post(
                     f"{api_url}/api/bus-arrival/batch",
-                    json=batch
+                    json=batch,
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 200:
-                        print(f"[{cur_time}] {len(batch)}건 전송 완료")
+                        elapsed = (cur_time - start_time).total_seconds()
+                        progress = (idx / len(df)) * 100
+                        print(f"[{cur_time.strftime('%H:%M:%S')}] {len(batch)}건 전송 | "
+                              f"진행: {progress:.1f}% | 경과: {elapsed/60:.1f}분")
                     else:
-                        print(f"[{cur_time}] API 오류: {resp.status}")
+                        text = await resp.text()
+                        print(f"[{cur_time}] API 오류: {resp.status}, {text[:200]}")
+            except asyncio.TimeoutError:
+                print(f"[{cur_time}] 타임아웃")
             except Exception as e:
                 print(f"전송 오류: {e}")
 
@@ -178,7 +201,9 @@ async def simulate_realtime_data(csv_path="data/bus_arrivals.csv",
             if idx < len(df):
                 next_time = df['collection_time'].iloc[idx]
                 wait = (next_time - cur_time).total_seconds() / speed_multiplier
-                await asyncio.sleep(max(0.05, wait))
+                await asyncio.sleep(max(0.01, wait))
+
+    print("\n=== 시뮬레이션 완료 ===")
 
 
 # ====================================================================
@@ -191,12 +216,16 @@ if __name__ == "__main__":
     parser.add_argument("--csv", default="bus_arrivals.csv")
     parser.add_argument("--api", default="http://localhost:8000")
     parser.add_argument("--interval", type=int, default=60)
-    parser.add_argument("--simulate", action="store_true")
-    parser.add_argument("--speed", type=int, default=60)
+    parser.add_argument("--simulate", action="store_true", 
+                       help="시뮬레이션 모드 (과거 데이터 재생)")
+    parser.add_argument("--speed", type=int, default=60,
+                       help="시뮬레이션 속도 배율")
 
     args = parser.parse_args()
 
     if args.simulate:
+        print("⚠️  시뮬레이션 모드로 실행합니다.")
+        print("    서버도 --simulation 플래그로 실행되어야 합니다!")
         asyncio.run(simulate_realtime_data(
             csv_path=args.csv,
             api_url=args.api,
