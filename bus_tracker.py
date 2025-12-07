@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
@@ -6,11 +6,11 @@ import numpy as np
 
 
 # ============================================================
-# 상태 정의
+# 버스 모드
 # ============================================================
-class BusStatus(Enum):
-    ACTIVE = "active"
-    PREDICTED = "predicted"
+class BusMode(Enum):
+    API = "api"           # API 데이터 사용 중
+    PREDICTED = "predicted"  # ML 예측 사용 중
 
 
 # ============================================================
@@ -22,21 +22,19 @@ class BusInfo:
     routeno: str
     nodeid: str
     nodenm: str
-    slot: int                   # 앞차 = 0 / 뒤차 = 1 / ...
+    slot: int
     arrprevstationcnt: int
     arrtime: int
     vehicletp: str
     routetp: str
 
-    # 상태
-    status: BusStatus = BusStatus.ACTIVE
-    last_update: datetime = field(default_factory=datetime.now)
-
-    # countdown용
+    # 모드 및 countdown
+    mode: BusMode = BusMode.API
     initial_arrtime: int = 0
-    last_station_change_time: datetime = field(default_factory=datetime.now)
-
-    # meta
+    prediction_time: datetime = field(default_factory=datetime.now)
+    
+    # 메타 정보
+    last_update: datetime = field(default_factory=datetime.now)
     weekday: str = ""
     time_slot: str = ""
     weather: str = ""
@@ -44,261 +42,100 @@ class BusInfo:
     humidity: float = 0.0
     rain_mm: float = 0.0
     snow_mm: float = 0.0
-
-    # 버스 식별을 위한 추가 정보
-    tracking_id: str = ""  # 내부 추적 ID
+    
+    tracking_id: str = ""
 
     def __post_init__(self):
-        # 초기 countdown 기준 부여
         if self.initial_arrtime == 0:
             self.initial_arrtime = self.arrtime
         
-        # tracking_id 생성
         if not self.tracking_id:
-            self.tracking_id = f"{self.routeid}_{self.nodeid}_{self.slot}_{int(self.last_update.timestamp())}"
+            self.tracking_id = f"{self.routeid}_{self.nodeid}_{self.slot}_{int(self.prediction_time.timestamp())}"
 
-    # ========================================================
-    # 남은 시간 계산 (현재 시간 기준)
-    # ========================================================
     def get_current_arrtime(self, current_time: datetime = None) -> int:
         """
-        current_time: 기준 시각 (None이면 실시간, 주어지면 시뮬레이션)
+        countdown 계산
+        
+        mode에 따라:
+        - API: arrtime 그대로 (API가 계속 업데이트)
+        - PREDICTED: countdown 계산
         """
         if current_time is None:
             current_time = datetime.now()
         
-        elapsed = (current_time - self.last_station_change_time).total_seconds()
-        return max(0, self.initial_arrtime - int(elapsed))
-
-    # ========================================================
-    # ACTIVE 모드 업데이트
-    # ========================================================
-    def update(self, new: dict, current_time: datetime = None):
-        if current_time is None:
-            current_time = datetime.now()
-
-        # 정류장 변화 → countdown 리셋
-        if new["arrprevstationcnt"] != self.arrprevstationcnt:
-            self.last_station_change_time = current_time
-            self.initial_arrtime = new["arrtime"]
-
-        # 필드 업데이트
-        self.arrprevstationcnt = new["arrprevstationcnt"]
-        self.arrtime = new["arrtime"]
-        self.vehicletp = new.get("vehicletp", self.vehicletp)
-        self.status = BusStatus.ACTIVE
-        self.last_update = current_time
-
-        # meta
-        for meta in ["weekday", "time_slot", "weather",
-                     "temp", "humidity", "rain_mm", "snow_mm"]:
-            if meta in new:
-                setattr(self, meta, new[meta])
+        if self.mode == BusMode.API:
+            # API 모드: API 값 그대로 사용
+            return self.arrtime
+        else:
+            # PREDICTED 모드: countdown
+            elapsed = (current_time - self.prediction_time).total_seconds()
+            remaining = max(0, self.initial_arrtime - int(elapsed))
+            return remaining
 
 
 # ============================================================
-# BusTracker (슬롯 기반 버스 다중 추적)
+# BusTracker - 하이브리드 모드
 # ============================================================
 class BusTracker:
+    """
+    하이브리드 모드 버스 추적기
+    
+    핵심 전략:
+    1. API 있을 때: API 값 사용 (ACTIVE)
+    2. API 끊기면: ML 예측 전환 (1회만!)
+    3. 이후: countdown만 (재예측 없음!)
+    
+    장점:
+    - API 정확도 + ML 안정성
+    - 최소 예측 (API 끊길 때만)
+    - CPU 효율적
+    """
 
-    def __init__(self, predictor=None, historical_data=None, simulation_mode=False):
+    def __init__(self, predictor=None, historical_data=None, 
+                 simulation_mode=False,
+                 api_timeout_seconds=100):  # 1분 40초
         self.predictor = predictor
         self.historical_data = historical_data
-        self.buses: Dict[str, BusInfo] = {}  # key: "routeid_nodeid_slot"
-        self.prediction_interval = 60        # 예측 업데이트 간격(초)
-        self.simulation_mode = simulation_mode  # 시뮬레이션 모드 플래그
-        self.current_time = datetime.now()   # 현재 시각 (시뮬레이션용)
+        self.buses: Dict[str, BusInfo] = {}
+        self.simulation_mode = simulation_mode
+        self.current_time = datetime.now()
+        self.api_timeout_seconds = api_timeout_seconds
+        
+        # 통계
+        self.stats = {
+            'total_predictions': 0,
+            'buses_tracked': 0,
+            'buses_arrived': 0,
+            'buses_disappeared': 0,
+            'api_to_ml_transitions': 0  # API → ML 전환 횟수
+        }
 
-    # key 생성
     def _key(self, routeid: str, nodeid: str, slot: int):
         return f"{routeid}_{nodeid}_{slot}"
 
-    # ============================================================
-    # 시간 처리 통일 - 현재 시각 반환
-    # ============================================================
     def _get_current_time(self) -> datetime:
-        """시뮬레이션 모드에서는 내부 시각, 실시간 모드에서는 현재 시각"""
         if self.simulation_mode:
             return self.current_time
         else:
             return datetime.now()
 
     def update_simulation_time(self, time: datetime):
-        """시뮬레이션 모드에서 시각 업데이트"""
         if self.simulation_mode:
             self.current_time = time
 
     # ============================================================
-    # 단일 row 입력 (main.py와 호환)
+    # ML 예측
     # ============================================================
-    def process_new_data(self, data: dict):
+    def _predict_arrival_time(self, bus: BusInfo, current_time: datetime) -> int:
         """
-        main.py에서 단일 row를 넣어도, 내부에서는 batch처럼 처리
+        ML로 도착 시간 예측
+        
+        호출 시점: API 끊길 때 (딱 1회!)
         """
-        # collection_time 업데이트
-        if 'collection_time' in data and isinstance(data['collection_time'], datetime):
-            if self.simulation_mode:
-                self.current_time = data['collection_time']
-        
-        self.process_batch([data])
-
-    # ============================================================
-    # 버스 매칭 알고리즘 - 최소 비용 매칭
-    # ============================================================
-    def _match_buses(self, existing_buses: List[BusInfo], new_data_list: List[dict]) -> List[tuple]:
-        """
-        기존 버스와 신규 데이터를 매칭
-        Returns: [(existing_bus_idx, new_data_idx), ...]
-        """
-        if not existing_buses:
-            return []
-        
-        if not new_data_list:
-            return []
-        
-        n_exist = len(existing_buses)
-        n_new = len(new_data_list)
-        
-        # 비용 행렬 생성
-        cost_matrix = np.zeros((n_exist, n_new))
-        
-        for i, bus in enumerate(existing_buses):
-            for j, new_data in enumerate(new_data_list):
-                # arrtime 차이를 비용으로 사용
-                # 정류장 수가 감소한 경우 보너스
-                station_diff = bus.arrprevstationcnt - new_data['arrprevstationcnt']
-                time_diff = abs(bus.arrtime - new_data['arrtime'])
-                
-                # 정류장이 진행된 경우(감소) 매칭 가능성 높임
-                if station_diff > 0:
-                    cost = time_diff * 0.5
-                elif station_diff == 0:
-                    cost = time_diff
-                else:
-                    # 정류장이 늘어난 경우 - 다른 버스일 가능성
-                    cost = time_diff * 2.0 + 1000
-                
-                cost_matrix[i, j] = cost
-        
-        # 간단한 greedy 매칭 (Hungarian algorithm 대신)
-        matches = []
-        used_new = set()
-        
-        # 비용이 낮은 순으로 정렬
-        pairs = []
-        for i in range(n_exist):
-            for j in range(n_new):
-                pairs.append((cost_matrix[i, j], i, j))
-        pairs.sort()
-        
-        # 각 버스는 한 번씩만 매칭
-        used_exist = set()
-        for cost, i, j in pairs:
-            if i not in used_exist and j not in used_new:
-                # 비용이 너무 크면 매칭하지 않음 (새 버스로 간주)
-                if cost < 500:  # threshold
-                    matches.append((i, j))
-                    used_exist.add(i)
-                    used_new.add(j)
-        
-        return matches
-
-    # ============================================================
-    # batch 단위 처리: 개선된 슬롯 재배치
-    # ============================================================
-    def process_batch(self, batch: List[dict]):
-        current_time = self._get_current_time()
-        
-        # 1) routeid + nodeid 그룹핑
-        groups = {}
-        for d in batch:
-            key = (d["routeid"], d["nodeid"])
-            groups.setdefault(key, []).append(d)
-
-        # 2) 각 그룹에서 버스 매칭 및 업데이트
-        for (routeid, nodeid), bus_list in groups.items():
-
-            # arrtime 기준 정렬
-            bus_list.sort(key=lambda x: x["arrtime"])
-
-            # 기존 버스 찾기
-            existing_keys = [
-                k for k in self.buses.keys()
-                if k.startswith(f"{routeid}_{nodeid}_")
-            ]
-            existing_buses = [self.buses[k] for k in existing_keys]
-
-            # 버스 매칭
-            matches = self._match_buses(existing_buses, bus_list)
-            
-            # 매칭된 버스 업데이트
-            matched_existing_idx = set()
-            matched_new_idx = set()
-            
-            for exist_idx, new_idx in matches:
-                existing_bus = existing_buses[exist_idx]
-                new_data = bus_list[new_idx]
-                existing_bus.update(new_data, current_time)
-                matched_existing_idx.add(exist_idx)
-                matched_new_idx.add(new_idx)
-            
-            # 매칭 안 된 신규 데이터 → 새 버스 생성
-            for j, new_data in enumerate(bus_list):
-                if j not in matched_new_idx:
-                    # 빈 슬롯 찾기
-                    used_slots = {int(k.split("_")[-1]) for k in existing_keys}
-                    new_slot = 0
-                    while new_slot in used_slots:
-                        new_slot += 1
-                    
-                    key = self._key(routeid, nodeid, new_slot)
-                    self.buses[key] = BusInfo(
-                        routeid=routeid,
-                        routeno=new_data["routeno"],
-                        nodeid=nodeid,
-                        nodenm=new_data["nodenm"],
-                        slot=new_slot,
-                        arrprevstationcnt=new_data["arrprevstationcnt"],
-                        arrtime=new_data["arrtime"],
-                        vehicletp=new_data["vehicletp"],
-                        routetp=new_data["routetp"],
-                        weekday=new_data["weekday"],
-                        time_slot=new_data["time_slot"],
-                        weather=new_data["weather"],
-                        temp=new_data["temp"],
-                        humidity=new_data["humidity"],
-                        rain_mm=new_data["rain_mm"],
-                        snow_mm=new_data["snow_mm"],
-                        last_update=current_time,
-                        last_station_change_time=current_time
-                    )
-            
-            # 매칭 안 된 기존 버스는 유지 (ACTIVE → PREDICTED로 전환 대기)
-
-    # ============================================================
-    # 오래된 ACTIVE 버스를 → PREDICTED 모드로 전환
-    # ============================================================
-    def check_lost_buses(self, timeout_seconds=180):
-        current_time = self._get_current_time()
-
-        for key, bus in list(self.buses.items()):
-            if bus.status == BusStatus.ACTIVE:
-                elapsed = (current_time - bus.last_update).total_seconds()
-                if elapsed >= timeout_seconds:
-                    bus.status = BusStatus.PREDICTED
-                    self._predict_bus(bus, current_time)
-
-    # ============================================================
-    # 개별 예측 수행
-    # ============================================================
-    def _predict_bus(self, bus: BusInfo, current_time: datetime):
-        # predictor 없는 경우 → countdown만 갱신
         if not self.predictor:
-            bus.initial_arrtime = bus.get_current_arrtime(current_time)
-            bus.last_station_change_time = current_time
-            return
+            # Fallback: 현재 arrtime 사용
+            return bus.arrtime
 
-        # ML 입력 feature 구성
         features = {
             "routeid": bus.routeid,
             "nodeid": bus.nodeid,
@@ -320,62 +157,289 @@ class BusTracker:
             "avg_time_per_station": max(1, bus.arrtime) / max(1, bus.arrprevstationcnt)
         }
 
-        # ML 예측 + fallback
         try:
             predicted = self.predictor.predict(features)
+            self.stats['total_predictions'] += 1
+            return int(predicted)
+        
         except Exception as e:
-            print(f"[ML 예측 실패 → fallback] {e}")
-
+            print(f"[ML 예측 실패 → Fallback] {e}")
+            
             if self.historical_data is not None:
-                predicted = self.predictor.predict_by_historical_pattern(
+                return int(self.predictor.predict_by_historical_pattern(
                     self.historical_data,
-                    bus.routeid, bus.nodeid, bus.arrprevstationcnt,
+                    bus.routeid, bus.nodeid, 
+                    bus.arrprevstationcnt,
                     bus.weekday, current_time.hour
-                )
+                ))
             else:
-                predicted = bus.arrprevstationcnt * 70
-
-        # countdown 기준 갱신
-        bus.arrtime = int(predicted)
-        bus.initial_arrtime = bus.arrtime
-        bus.last_station_change_time = current_time
+                return bus.arrtime
 
     # ============================================================
-    # PREDICTED 모드 버스 → 정해진 주기마다 재예측
+    # 버스 매칭
     # ============================================================
-    def update_predictions(self):
+    def _match_buses(self, existing_buses: List[BusInfo], new_data_list: List[dict]) -> List[tuple]:
+        """기존 버스와 신규 데이터 매칭"""
+        if not existing_buses or not new_data_list:
+            return []
+        
+        n_exist = len(existing_buses)
+        n_curr = len(new_data_list)
+        
+        cost_matrix = np.full((n_exist, n_curr), np.inf)
+        
+        for i, bus in enumerate(existing_buses):
+            for j, new_data in enumerate(new_data_list):
+                station_diff = bus.arrprevstationcnt - new_data['arrprevstationcnt']
+                
+                if station_diff < 0:
+                    continue
+                
+                if j < i:
+                    continue
+                
+                time_diff = abs(bus.arrtime - new_data['arrtime'])
+                
+                if station_diff == 0:
+                    cost = time_diff
+                else:
+                    cost = station_diff * 5
+                
+                cost_matrix[i, j] = cost
+        
+        matches = []
+        used_exist = set()
+        used_new = set()
+        
+        pairs = []
+        for i in range(n_exist):
+            for j in range(n_curr):
+                if cost_matrix[i, j] < np.inf:
+                    pairs.append((cost_matrix[i, j], i, j))
+        pairs.sort()
+        
+        for cost, i, j in pairs:
+            if i not in used_exist and j not in used_new and cost < 500:
+                matches.append((i, j))
+                used_exist.add(i)
+                used_new.add(j)
+        
+        return matches
+
+    # ============================================================
+    # 데이터 처리 (하이브리드!)
+    # ============================================================
+    def process_new_data(self, data: dict):
+        """단일 데이터 처리"""
+        if 'collection_time' in data and isinstance(data['collection_time'], datetime):
+            if self.simulation_mode:
+                self.current_time = data['collection_time']
+        
+        self.process_batch([data])
+
+    def process_batch(self, batch: List[dict]):
+        """
+        배치 처리 (하이브리드 모드)
+        
+        핵심:
+        1. 매칭된 버스: API 모드 유지, arrtime 업데이트
+        2. 매칭 안 된 버스: cleanup에서 API → ML 전환
+        3. 새 버스: API 모드로 시작
+        """
         current_time = self._get_current_time()
+        groups = {}
+        
+        for d in batch:
+            key = (d["routeid"], d["nodeid"])
+            groups.setdefault(key, []).append(d)
 
+        for (routeid, nodeid), bus_list in groups.items():
+            bus_list.sort(key=lambda x: x["arrtime"])
+
+            existing_keys = [
+                k for k in self.buses.keys()
+                if k.startswith(f"{routeid}_{nodeid}_")
+            ]
+            existing_buses = [self.buses[k] for k in existing_keys]
+
+            matches = self._match_buses(existing_buses, bus_list)
+            
+            matched_existing_idx = set()
+            matched_new_idx = set()
+            
+            # ★ 매칭된 버스 업데이트
+            for exist_idx, new_idx in matches:
+                existing_bus = existing_buses[exist_idx]
+                new_data = bus_list[new_idx]
+                
+                # API 모드로 복귀 (끊겼다가 다시 연결된 경우)
+                if existing_bus.mode == BusMode.PREDICTED:
+                    print(f"🔄 ML → API 복귀: {existing_bus.routeid} #{existing_bus.slot}")
+                    existing_bus.mode = BusMode.API
+                
+                # API 값 업데이트
+                existing_bus.arrtime = new_data['arrtime']
+                existing_bus.arrprevstationcnt = new_data['arrprevstationcnt']
+                existing_bus.last_update = current_time
+                
+                # 메타 정보 업데이트
+                for meta in ["weekday", "time_slot", "weather",
+                           "temp", "humidity", "rain_mm", "snow_mm"]:
+                    if meta in new_data:
+                        setattr(existing_bus, meta, new_data[meta])
+                
+                matched_existing_idx.add(exist_idx)
+                matched_new_idx.add(new_idx)
+            
+            # ★ 새 버스 생성 (API 모드로 시작)
+            for j, new_data in enumerate(bus_list):
+                if j not in matched_new_idx:
+                    used_slots = {int(k.split("_")[-1]) for k in existing_keys}
+                    new_slot = 0
+                    while new_slot in used_slots:
+                        new_slot += 1
+                    
+                    key = self._key(routeid, nodeid, new_slot)
+                    self.buses[key] = BusInfo(
+                        routeid=routeid,
+                        routeno=new_data["routeno"],
+                        nodeid=nodeid,
+                        nodenm=new_data["nodenm"],
+                        slot=new_slot,
+                        arrprevstationcnt=new_data["arrprevstationcnt"],
+                        arrtime=new_data["arrtime"],
+                        initial_arrtime=new_data["arrtime"],
+                        vehicletp=new_data["vehicletp"],
+                        routetp=new_data["routetp"],
+                        mode=BusMode.API,  # ★ API 모드로 시작
+                        weekday=new_data["weekday"],
+                        time_slot=new_data["time_slot"],
+                        weather=new_data["weather"],
+                        temp=new_data["temp"],
+                        humidity=new_data["humidity"],
+                        rain_mm=new_data["rain_mm"],
+                        snow_mm=new_data["snow_mm"],
+                        last_update=current_time,
+                        prediction_time=current_time
+                    )
+                    
+                    self.stats['buses_tracked'] += 1
+                    print(f"🆕 새 버스 (API): {routeid} #{new_slot} @ {new_data['nodenm']} "
+                          f"(arrtime: {new_data['arrtime']}초)")
+
+    # ============================================================
+    # 정리 작업 (핵심!)
+    # ============================================================
+    def cleanup(self):
+        """
+        정리 작업 (하이브리드 모드)
+        
+        1. API → ML 전환 (100초 타임아웃)
+        2. countdown 기반 도착 제거
+        3. 완전히 사라진 버스 제거 (10분)
+        """
+        current_time = self._get_current_time()
+        
+        # 1. API 끊긴 버스 → ML 전환
+        self._check_api_timeout(current_time)
+        
+        # 2. 도착 버스 제거
+        arrived = self._remove_arrived_buses(threshold_seconds=30)
+        
+        # 3. 사라진 버스 제거
+        disappeared = self._remove_disappeared_buses(timeout_seconds=600)
+        
+        # 통계 출력
+        total = len(self.buses)
+        if arrived > 0 or disappeared > 0 or total > 0:
+            api_count = sum(1 for b in self.buses.values() if b.mode == BusMode.API)
+            ml_count = sum(1 for b in self.buses.values() if b.mode == BusMode.PREDICTED)
+            
+            print(f"📊 현재 추적: {total}대 (API: {api_count}, ML: {ml_count}) | "
+                  f"예측: {self.stats['total_predictions']}회, "
+                  f"도착: {self.stats['buses_arrived']}대, "
+                  f"API→ML: {self.stats['api_to_ml_transitions']}회")
+
+    def _check_api_timeout(self, current_time: datetime):
+        """
+        API 끊긴 버스 감지 및 ML 전환
+        
+        핵심: 100초간 매칭 안 되면 API 끊긴 것으로 간주
+        """
+        transitioned = []
+        
         for key, bus in self.buses.items():
-            if bus.status == BusStatus.PREDICTED:
-                elapsed = (current_time - bus.last_station_change_time).total_seconds()
-                if elapsed >= self.prediction_interval:
-                    self._predict_bus(bus, current_time)
+            # API 모드이면서 오래 업데이트 안 됨
+            if bus.mode == BusMode.API:
+                elapsed = (current_time - bus.last_update).total_seconds()
+                
+                if elapsed >= self.api_timeout_seconds:
+                    # ★ API → ML 전환!
+                    print(f"⚠️  API 타임아웃 → ML 전환: {bus.routeid} #{bus.slot} "
+                          f"({elapsed/60:.1f}분 전 마지막 API)")
+                    
+                    # ML 예측 수행 (딱 1회!)
+                    predicted_time = self._predict_arrival_time(bus, current_time)
+                    
+                    bus.mode = BusMode.PREDICTED
+                    bus.initial_arrtime = predicted_time
+                    bus.prediction_time = current_time
+                    
+                    self.stats['api_to_ml_transitions'] += 1
+                    transitioned.append(bus)
+        
+        if transitioned:
+            print(f"🔄 API → ML 전환: {len(transitioned)}대")
 
-    # ============================================================
-    # 도착한 버스 제거 (arrtime <= threshold)
-    # ============================================================
-    def remove_arrived_buses(self, threshold_seconds=10):
+    def _remove_arrived_buses(self, threshold_seconds=30):
+        """countdown 기반 도착 버스 제거"""
         current_time = self._get_current_time()
         to_delete = []
         
         for key, bus in self.buses.items():
-            if bus.get_current_arrtime(current_time) <= threshold_seconds:
-                to_delete.append(key)
+            remaining = bus.get_current_arrtime(current_time)
+            if remaining <= threshold_seconds:
+                to_delete.append((key, bus))
 
-        for k in to_delete:
-            del self.buses[k]
+        if to_delete:
+            print(f"🚏 도착 제거: {len(to_delete)}대")
+            for key, bus in to_delete:
+                print(f"  - {bus.routeid} #{bus.slot} ({bus.mode.value})")
+                del self.buses[key]
+                self.stats['buses_arrived'] += 1
+        
+        return len(to_delete)
+
+    def _remove_disappeared_buses(self, timeout_seconds=600):
+        """완전히 사라진 버스 제거 (10분)"""
+        current_time = self._get_current_time()
+        to_delete = []
+        
+        for key, bus in self.buses.items():
+            elapsed = (current_time - bus.last_update).total_seconds()
+            if elapsed >= timeout_seconds:
+                to_delete.append((key, bus, elapsed))
+        
+        if to_delete:
+            print(f"🗑️  사라진 버스 제거: {len(to_delete)}대")
+            for key, bus, elapsed in to_delete:
+                print(f"  - {bus.routeid} #{bus.slot}: {elapsed/60:.1f}분 전")
+                del self.buses[key]
+                self.stats['buses_disappeared'] += 1
+        
+        return len(to_delete)
 
     # ============================================================
-    # 노선 + 정류장 조회 API와 연동
+    # 조회 API
     # ============================================================
     def get_bus_info(self, routeid: str, nodeid: str) -> List[dict]:
+        """노선 + 정류장 조회"""
         current_time = self._get_current_time()
         result = []
         
         for bus in self.buses.values():
             if bus.routeid == routeid and bus.nodeid == nodeid:
-                cur = bus.get_current_arrtime(current_time)
+                remaining = bus.get_current_arrtime(current_time)
                 result.append({
                     "routeid": bus.routeid,
                     "routeno": bus.routeno,
@@ -383,28 +447,25 @@ class BusTracker:
                     "nodenm": bus.nodenm,
                     "slot": bus.slot,
                     "arrprevstationcnt": bus.arrprevstationcnt,
-                    "arrtime": cur,
-                    "display_minutes": cur // 60,
-                    "display_seconds": cur % 60,
+                    "arrtime": remaining,
+                    "display_minutes": remaining // 60,
+                    "display_seconds": remaining % 60,
                     "vehicletp": bus.vehicletp,
                     "routetp": bus.routetp,
-                    "status": bus.status.value,
+                    "mode": bus.mode.value,  # api or predicted
                     "last_update": bus.last_update.isoformat(),
                 })
 
-        # arrtime 오름차순 정렬
         result.sort(key=lambda x: x["arrtime"])
         return result
 
-    # ============================================================
-    # 전체 버스 조회
-    # ============================================================
-    def get_all_buses(self):
+    def get_all_buses(self) -> List[dict]:
+        """전체 버스 조회"""
         current_time = self._get_current_time()
         result = []
         
         for bus in self.buses.values():
-            cur = bus.get_current_arrtime(current_time)
+            remaining = bus.get_current_arrtime(current_time)
             result.append({
                 "routeid": bus.routeid,
                 "routeno": bus.routeno,
@@ -412,13 +473,32 @@ class BusTracker:
                 "nodenm": bus.nodenm,
                 "slot": bus.slot,
                 "arrprevstationcnt": bus.arrprevstationcnt,
-                "arrtime": cur,
-                "display_minutes": cur // 60,
-                "display_seconds": cur % 60,
+                "arrtime": remaining,
+                "display_minutes": remaining // 60,
+                "display_seconds": remaining % 60,
                 "vehicletp": bus.vehicletp,
                 "routetp": bus.routetp,
-                "status": bus.status.value,
+                "mode": bus.mode.value,
                 "last_update": bus.last_update.isoformat(),
             })
 
         return result
+
+    def get_stats(self) -> dict:
+        """통계 정보"""
+        api_count = sum(1 for b in self.buses.values() if b.mode == BusMode.API)
+        ml_count = sum(1 for b in self.buses.values() if b.mode == BusMode.PREDICTED)
+        
+        return {
+            'total_buses': len(self.buses),
+            'api_buses': api_count,
+            'ml_buses': ml_count,
+            'total_predictions': self.stats['total_predictions'],
+            'buses_tracked': self.stats['buses_tracked'],
+            'buses_arrived': self.stats['buses_arrived'],
+            'buses_disappeared': self.stats['buses_disappeared'],
+            'api_to_ml_transitions': self.stats['api_to_ml_transitions'],
+            'avg_predictions_per_bus': (
+                self.stats['total_predictions'] / max(1, self.stats['buses_tracked'])
+            )
+        }
