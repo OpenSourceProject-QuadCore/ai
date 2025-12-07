@@ -124,24 +124,48 @@ class BusTracker:
             self.current_time = time
 
     # ============================================================
-    # ML 예측
+    # ML 예측 (★★★ 완전 개선 버전 ★★★)
     # ============================================================
     def _predict_arrival_time(self, bus: BusInfo, current_time: datetime) -> int:
-        """
-        ML로 도착 시간 예측
-        
-        호출 시점: API 끊길 때 (딱 1회!)
-        """
         if not self.predictor:
-            # Fallback: 현재 arrtime 사용
             return bus.arrtime
 
+        # ============================================================
+        # ★★★ 경과 시간 보정 ★★★
+        # ============================================================
+        elapsed_seconds = (current_time - bus.last_update).total_seconds()
+        
+        # 1. 평균 정류장당 시간 계산
+        if bus.arrprevstationcnt > 0 and bus.arrtime > 0:
+            avg_time_per_station = bus.arrtime / bus.arrprevstationcnt
+        else:
+            avg_time_per_station = 60  # 기본값
+        
+        # 2. 경과 시간 동안 지나간 정류장 수 추정
+        estimated_stations_passed = int(elapsed_seconds / avg_time_per_station)
+        
+        # 3. 현재 상태 추정
+        current_station_cnt = max(0, bus.arrprevstationcnt - estimated_stations_passed)
+        current_arrtime = max(0, bus.arrtime - elapsed_seconds)
+        
+        # ============================================================
+        # ★★★ 안전 장치: 이미 도착한 버스 체크 ★★★
+        # ============================================================
+        if current_arrtime <= 0 or current_station_cnt <= 0:
+            print(f"  [ML 예측 스킵] {bus.routeid} #{bus.slot}: 이미 도착 추정")
+            print(f"    📍 경과: {elapsed_seconds:.0f}초 ({elapsed_seconds/60:.1f}분)")
+            print(f"    🚫 보정 arrtime: {current_arrtime:.0f}초, 정류장: {current_station_cnt}개")
+            return 0
+        
+        # ============================================================
+        # ★★★ 보정된 Feature로 예측 ★★★
+        # ============================================================
         features = {
             "routeid": bus.routeid,
             "nodeid": bus.nodeid,
             "routetp": bus.routetp,
             "vehicletp": bus.vehicletp,
-            "arrprevstationcnt": bus.arrprevstationcnt,
+            "arrprevstationcnt": current_station_cnt,  # ★ 보정!
             "weekday": bus.weekday,
             "time_slot": bus.time_slot,
             "weather": bus.weather,
@@ -154,26 +178,58 @@ class BusTracker:
             "day_of_week": current_time.weekday(),
             "is_weekend": 1 if current_time.weekday() >= 5 else 0,
             "is_rush_hour": 1 if current_time.hour in [7,8,9,17,18,19] else 0,
-            "avg_time_per_station": max(1, bus.arrtime) / max(1, bus.arrprevstationcnt)
+            "avg_time_per_station": avg_time_per_station
         }
 
         try:
             predicted = self.predictor.predict(features)
             self.stats['total_predictions'] += 1
+            
+            # ============================================================
+            # ★★★ 상세 로그 (디버깅용) ★★★
+            # ============================================================
+            print(f"  [ML 예측] {bus.routeid} #{bus.slot}")
+            print(f"    📍 경과: {elapsed_seconds:.0f}초 ({elapsed_seconds/60:.1f}분)")
+            print(f"    📊 원본: {bus.arrprevstationcnt}개 정류장, {bus.arrtime}초 ({bus.arrtime/60:.1f}분)")
+            print(f"    🔧 보정: {current_station_cnt}개 정류장, {current_arrtime:.0f}초 ({current_arrtime/60:.1f}분)")
+            print(f"    🎯 예측: {predicted:.0f}초 ({predicted/60:.1f}분)")
+            
+            # ============================================================
+            # ★★★ 예측값 검증 ★★★
+            # ============================================================
+            if predicted < 0:
+                print(f"    ⚠️  음수 예측 감지 → 0으로 보정")
+                return 0
+            elif predicted > 3600:  # 1시간 이상
+                print(f"    ⚠️  과도한 예측 ({predicted/60:.1f}분) → 보정값 사용")
+                return int(current_arrtime)
+            
             return int(predicted)
         
         except Exception as e:
-            print(f"[ML 예측 실패 → Fallback] {e}")
+            print(f"  [ML 예측 실패 → Fallback] {e}")
             
+            # ============================================================
+            # ★★★ Fallback 체계 ★★★
+            # ============================================================
+            
+            # Fallback 1: Historical Pattern (있으면)
             if self.historical_data is not None:
-                return int(self.predictor.predict_by_historical_pattern(
-                    self.historical_data,
-                    bus.routeid, bus.nodeid, 
-                    bus.arrprevstationcnt,
-                    bus.weekday, current_time.hour
-                ))
-            else:
-                return bus.arrtime
+                try:
+                    historical = self.predictor.predict_by_historical_pattern(
+                        self.historical_data,
+                        bus.routeid, bus.nodeid, 
+                        current_station_cnt,  # ★ 보정된 값 사용
+                        bus.weekday, current_time.hour
+                    )
+                    print(f"  [Historical Pattern] {historical:.0f}초 ({historical/60:.1f}분)")
+                    return int(historical)
+                except Exception as e2:
+                    print(f"  [Historical 실패] {e2}")
+            
+            # Fallback 2: 보정된 arrtime 직접 사용
+            print(f"  [최종 Fallback] 보정된 arrtime: {current_arrtime:.0f}초 ({current_arrtime/60:.1f}분)")
+            return int(current_arrtime)
 
     # ============================================================
     # 버스 매칭
@@ -362,7 +418,7 @@ class BusTracker:
 
     def _check_api_timeout(self, current_time: datetime):
         """
-        API 끊긴 버스 감지 및 ML 전환
+        API 끊긴 버스 감지 및 ML 전환 (★★★ 상세 로그 추가 ★★★)
         
         핵심: 100초간 매칭 안 되면 API 끊긴 것으로 간주
         """
@@ -374,9 +430,25 @@ class BusTracker:
                 elapsed = (current_time - bus.last_update).total_seconds()
                 
                 if elapsed >= self.api_timeout_seconds:
-                    # ★ API → ML 전환!
-                    print(f"⚠️  API 타임아웃 → ML 전환: {bus.routeid} #{bus.slot} "
-                          f"({elapsed/60:.1f}분 전 마지막 API)")
+                    # ============================================================
+                    # ★★★ 보정 정보 미리 계산 (로그용) ★★★
+                    # ============================================================
+                    if bus.arrprevstationcnt > 0 and bus.arrtime > 0:
+                        avg_time = bus.arrtime / bus.arrprevstationcnt
+                        stations_passed = int(elapsed / avg_time)
+                        current_stations = max(0, bus.arrprevstationcnt - stations_passed)
+                    else:
+                        avg_time = 60
+                        stations_passed = 0
+                        current_stations = bus.arrprevstationcnt
+                    
+                    # ============================================================
+                    # ★★★ API → ML 전환 (상세 로그!) ★★★
+                    # ============================================================
+                    print(f"⚠️  API 타임아웃 → ML 전환: {bus.routeid} #{bus.slot}")
+                    print(f"   📍 {elapsed/60:.1f}분 전 마지막 API")
+                    print(f"   📊 원본: {bus.arrprevstationcnt}개 정류장, {bus.arrtime}초")
+                    print(f"   🔧 예상: {current_stations}개 정류장 (약 {stations_passed}개 지남)")
                     
                     # ML 예측 수행 (딱 1회!)
                     predicted_time = self._predict_arrival_time(bus, current_time)
