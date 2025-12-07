@@ -1,12 +1,6 @@
 # 🚍 구미 버스 실시간 도착 예측 시스템
 
 실시간 버스 API와 머신러닝을 결합한 하이브리드 버스 도착 예측 시스템
-
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
-[![scikit-learn](https://img.shields.io/badge/scikit--learn-1.3+-orange.svg)](https://scikit-learn.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 ---
 
 ## 📋 목차
@@ -165,8 +159,8 @@
 ### 1. 저장소 클론
 
 ```bash
-git clone https://github.com/your-repo/bus-prediction.git
-cd bus-prediction
+git clone https://github.com/OpenSourceProject-QuadCore/ai.git
+cd ai
 ```
 
 ### 2. 가상환경 생성
