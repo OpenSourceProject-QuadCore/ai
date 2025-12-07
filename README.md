@@ -2,7 +2,7 @@
 
 실시간 버스 API와 머신러닝을 결합한 하이브리드 버스 도착 예측 시스템
 
-도착 정보 csv: https://drive.google.com/file/d/1ZLV32U1Bmip4_lRrz6KijFrbqbm-q3IE/view?usp=drive_link
+- 과거 도착 정보 csv: https://drive.google.com/file/d/1ZLV32U1Bmip4_lRrz6KijFrbqbm-q3IE/view?usp=drive_link
 ---
 
 ## 📋 목차
