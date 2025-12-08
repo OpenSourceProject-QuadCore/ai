@@ -465,7 +465,7 @@ class BusDataPreprocessor:
         required_cols = [
             "routeid", "nodeid", "bus_index", "collection_time",
             "arrprevstationcnt", "arrtime",
-            "prev_station", "prev_arrtime", "prev_time",
+            "prev_station", "prev_arrtime", "prev_time", "time_elapsed",
         ]
         for c in required_cols:
             if c not in df.columns:

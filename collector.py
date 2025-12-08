@@ -2,6 +2,7 @@ import requests
 import csv
 import time
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 SERVER_URL = "http://localhost:8000/api/bus-arrival/batch"
@@ -9,8 +10,8 @@ SERVER_URL = "http://localhost:8000/api/bus-arrival/batch"
 # ==============================
 # 1) 사용자 설정
 # ==============================
-SERVICE_KEY = "YOUR_CODE"
-KMA_API_KEY = "YOUR_CODE"
+SERVICE_KEY = "a1a05716a1d9f1f95f6fd8787212782eaebe2b75ed10dca127e0604041e591c8"
+KMA_API_KEY = "a1a05716a1d9f1f95f6fd8787212782eaebe2b75ed10dca127e0604041e591c8"
 
 CITY_CODE = "37050"
 LOOP_INTERVAL_SECONDS = 60
@@ -263,7 +264,21 @@ def get_kma_forecast():
                 m = {0:"Clear",1:"Rain",2:"Rain/Snow",3:"Snow",5:"Drizzle"}
                 weather = m.get(int(val), "Unknown")
             elif cat == "PCP":
-                rain = 0 if val == "강수없음" else float(val.replace("mm", ""))
+                # ============================================================
+                # ★★★ 다양한 형식 지원! ★★★
+                # ============================================================
+                if val == "강수없음":
+                    rain = 0.0
+                elif "mm" in val:
+                    # "1.0mm", "1.0mm 미만", "30.0 mm" 모두 지원
+                    num_str = val.split("mm")[0].strip()
+                    try:
+                        rain = float(num_str)
+                    except ValueError:
+                        # "미만" 등의 경우 → None 처리 (현재값 사용)
+                        rain = None
+                else:
+                    rain = None
             elif cat == "SNO":
                 snow = 0 if val == "적설없음" else float(val.replace("cm", "")) * 10.0
 
@@ -275,27 +290,46 @@ def get_kma_forecast():
 
 
 # ---- 결합 + 캐싱 ----
-last_weather_time = 0
-cached_weather = (None, None, None, None, None)
+class WeatherCache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_update = 0
+        self._cached_data = (None, None, None, None, None)
+    
+    def get(self):
+        now = time.time()
+        
+        # 캐시 유효성 체크 (락 없이)
+        if now - self._last_update < 120:
+            return self._cached_data
+        
+        # 캐시 갱신 (락 사용)
+        with self._lock:
+            # Double-checked locking
+            if now - self._last_update < 120:
+                return self._cached_data
+            
+            # 날씨 데이터 가져오기
+            nw = get_kma_current()
+            fc = get_kma_forecast()
+            
+            weather = nw[0] or fc[0]
+            temp = nw[1] if nw[1] is not None else fc[1]
+            hum  = nw[2] if nw[2] is not None else fc[2]
+            rain = nw[3] if nw[3] is not None else fc[3]
+            snow = nw[4] if nw[4] is not None else fc[4]
+            
+            self._cached_data = (weather, temp, hum, rain, snow)
+            self._last_update = now
+            
+            return self._cached_data
+
+# 전역 인스턴스
+weather_cache = WeatherCache()
 
 def get_kma_weather_combined():
-    global last_weather_time, cached_weather
-
-    now = time.time()
-    if now - last_weather_time > 120:  # 2분 캐시
-        nw = get_kma_current()
-        fc = get_kma_forecast()
-
-        weather = nw[0] or fc[0]
-        temp = nw[1] if nw[1] is not None else fc[1]
-        hum  = nw[2] if nw[2] is not None else fc[2]
-        rain = nw[3] if nw[3] is not None else fc[3]
-        snow = nw[4] if nw[4] is not None else fc[4]
-
-        cached_weather = (weather, temp, hum, rain, snow)
-        last_weather_time = now
-
-    return cached_weather
+    """날씨 정보 조회 (캐싱 적용)"""
+    return weather_cache.get()
 
 
 # =========================

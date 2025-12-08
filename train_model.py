@@ -118,9 +118,9 @@ def main():
     
     print(f"\n서버 실행 명령:")
     print(f"  # 실시간 모드:")
-    print(f"  python main_hybrid.py")
+    print(f"  python main.py")
     print(f"\n  # 시뮬레이션 모드:")
-    print(f"  python main_hybrid.py --simulation")
+    print(f"  python main.py --simulation")
     
     print(f"\n재학습 명령:")
     print(f"  # 전처리 재사용:")

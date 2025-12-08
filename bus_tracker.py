@@ -54,22 +54,31 @@ class BusInfo:
 
     def get_current_arrtime(self, current_time: datetime = None) -> int:
         """
-        countdown 계산
+        countdown 계산 (★★★ API 모드도 적용! ★★★)
         
-        mode에 따라:
-        - API: arrtime 그대로 (API가 계속 업데이트)
-        - PREDICTED: countdown 계산
+        mode에 관계없이:
+        - last_update 이후 경과 시간만큼 차감
+        - 실시간 countdown 구현
         """
         if current_time is None:
             current_time = datetime.now()
         
         if self.mode == BusMode.API:
-            # API 모드: API 값 그대로 사용
-            return self.arrtime
+            # ============================================================
+            # ★★★ API 모드도 countdown 적용! ★★★
+            # ============================================================
+            # last_update 이후 경과 시간 계산
+            elapsed = (current_time - self.last_update).total_seconds()
+            
+            # arrtime에서 경과 시간 차감
+            remaining = max(0, self.arrtime - int(elapsed))
+            
+            return remaining
         else:
-            # PREDICTED 모드: countdown
+            # PREDICTED 모드: 기존 방식
             elapsed = (current_time - self.prediction_time).total_seconds()
             remaining = max(0, self.initial_arrtime - int(elapsed))
+            
             return remaining
 
 
@@ -127,6 +136,16 @@ class BusTracker:
     # ML 예측 (★★★ 완전 개선 버전 ★★★)
     # ============================================================
     def _predict_arrival_time(self, bus: BusInfo, current_time: datetime) -> int:
+        """
+        ML로 도착 시간 예측 (경과 시간 보정 + 완전 개선!)
+        
+        개선 사항:
+        1. ✅ 경과 시간 보정
+        2. ✅ 이미 도착한 버스 체크
+        3. ✅ 상세 로그
+        4. ✅ 예측값 검증
+        5. ✅ 안전한 Fallback
+        """
         if not self.predictor:
             return bus.arrtime
 
@@ -235,38 +254,50 @@ class BusTracker:
     # 버스 매칭
     # ============================================================
     def _match_buses(self, existing_buses: List[BusInfo], new_data_list: List[dict]) -> List[tuple]:
-        """기존 버스와 신규 데이터 매칭"""
+        """기존 버스와 신규 데이터 매칭 (실시간용 간소화 버전)"""
         if not existing_buses or not new_data_list:
             return []
         
         n_exist = len(existing_buses)
         n_curr = len(new_data_list)
-        
         cost_matrix = np.full((n_exist, n_curr), np.inf)
         
         for i, bus in enumerate(existing_buses):
             for j, new_data in enumerate(new_data_list):
-                station_diff = bus.arrprevstationcnt - new_data['arrprevstationcnt']
+                prev_station = float(bus.arrprevstationcnt)
+                prev_arrtime = float(bus.arrtime)
+                curr_station = float(new_data['arrprevstationcnt'])
+                curr_arrtime = float(new_data['arrtime'])
                 
-                if station_diff < 0:
-                    continue
-                
+                # 1) 추월 불가 (앞에 있던 버스가 뒤로 가지 않음)
                 if j < i:
                     continue
                 
-                time_diff = abs(bus.arrtime - new_data['arrtime'])
+                # 2) 정류장은 유지 또는 감소만 가능
+                if curr_station > prev_station:
+                    continue
+                
+                station_diff = prev_station - curr_station
+                time_diff = prev_arrtime - curr_arrtime  # 줄어들어야 정상
                 
                 if station_diff == 0:
-                    cost = time_diff
+                    # 정류장 같으면 arrtime도 거의 같아야 함 (60초 이내)
+                    if abs(time_diff) > 60:
+                        continue
+                    cost = abs(time_diff)
                 else:
-                    cost = station_diff * 5
+                    # 정류장 줄었으면 arrtime도 줄어야 함
+                    if time_diff <= 0:
+                        continue
+                    avg_time_per_station = time_diff / max(station_diff, 1e-6)
+                    if avg_time_per_station < 10 or avg_time_per_station > 600:
+                        continue
+                    cost = station_diff * 5  # 정류장 수를 더 강하게 반영
                 
-                cost_matrix[i, j] = cost
+                order_penalty = max(j - i, 0) * 20
+                cost_matrix[i, j] = cost + order_penalty
         
-        matches = []
-        used_exist = set()
-        used_new = set()
-        
+        # 최소 비용 매칭 (Greedy)
         pairs = []
         for i in range(n_exist):
             for j in range(n_curr):
@@ -274,6 +305,9 @@ class BusTracker:
                     pairs.append((cost_matrix[i, j], i, j))
         pairs.sort()
         
+        matches = []
+        used_exist = set()
+        used_new = set()
         for cost, i, j in pairs:
             if i not in used_exist and j not in used_new and cost < 500:
                 matches.append((i, j))
@@ -281,6 +315,7 @@ class BusTracker:
                 used_new.add(j)
         
         return matches
+
 
     # ============================================================
     # 데이터 처리 (하이브리드!)
@@ -298,14 +333,42 @@ class BusTracker:
         배치 처리 (하이브리드 모드)
         
         핵심:
-        1. 매칭된 버스: API 모드 유지, arrtime 업데이트
-        2. 매칭 안 된 버스: cleanup에서 API → ML 전환
-        3. 새 버스: API 모드로 시작
+        1. ★★★ API 데이터 중복 제거! ★★★
+        2. 매칭된 버스: arrtime 변경 시에만 갱신
+        3. 매칭 안 된 버스: cleanup에서 API → ML 전환
+        4. 새 버스: API 모드로 시작
         """
         current_time = self._get_current_time()
-        groups = {}
+        
+        # ============================================================
+        # ★★★ STEP 1: 중복 제거 ★★★
+        # ============================================================
+        # 같은 (routeid, nodeid, arrtime, arrprevstationcnt)는 하나만 유지
+        seen = set()
+        deduplicated_batch = []
         
         for d in batch:
+            # 고유 키 생성
+            key = (d["routeid"], d["nodeid"], d["arrtime"], d["arrprevstationcnt"])
+            
+            if key not in seen:
+                seen.add(key)
+                deduplicated_batch.append(d)
+            # else:
+            #     print(f"🔄 중복 제거: {d['routeid']} @ {d['nodenm']} "
+            #           f"(arrtime: {d['arrtime']}초, 정류장: {d['arrprevstationcnt']}개)")
+        
+        # 중복 제거 통계 (선택: 주석 처리 가능)
+        removed = len(batch) - len(deduplicated_batch)
+        if removed > 0:
+            print(f"📊 중복 제거: {removed}개 (원본: {len(batch)}개 → 처리: {len(deduplicated_batch)}개)")
+        
+        # ============================================================
+        # ★★★ STEP 2: 그룹화 (중복 제거된 데이터로!) ★★★
+        # ============================================================
+        groups = {}
+        
+        for d in deduplicated_batch:
             key = (d["routeid"], d["nodeid"])
             groups.setdefault(key, []).append(d)
 
@@ -323,7 +386,9 @@ class BusTracker:
             matched_existing_idx = set()
             matched_new_idx = set()
             
-            # ★ 매칭된 버스 업데이트
+            # ============================================================
+            # ★★★ 매칭된 버스 업데이트 (arrtime 변경 시에만) ★★★
+            # ============================================================
             for exist_idx, new_idx in matches:
                 existing_bus = existing_buses[exist_idx]
                 new_data = bus_list[new_idx]
@@ -333,9 +398,36 @@ class BusTracker:
                     print(f"🔄 ML → API 복귀: {existing_bus.routeid} #{existing_bus.slot}")
                     existing_bus.mode = BusMode.API
                 
-                # API 값 업데이트
-                existing_bus.arrtime = new_data['arrtime']
-                existing_bus.arrprevstationcnt = new_data['arrprevstationcnt']
+                # ============================================================
+                # ★★★ arrtime 또는 arrprevstationcnt가 변경되었는지 확인 ★★★
+                # ============================================================
+                arrtime_changed = (existing_bus.arrtime != new_data['arrtime'])
+                station_changed = (existing_bus.arrprevstationcnt != new_data['arrprevstationcnt'])
+                
+                if arrtime_changed or station_changed:
+                    # 값이 실제로 변경됨 → 갱신!
+                    old_arrtime = existing_bus.arrtime
+                    old_station = existing_bus.arrprevstationcnt
+                    
+                    existing_bus.arrtime = new_data['arrtime']
+                    existing_bus.arrprevstationcnt = new_data['arrprevstationcnt']
+                    
+                    # 선택: 변경 로그 (디버깅용, 필요시 주석 해제)
+                    # print(f"  ✏️  갱신: {existing_bus.routeid} #{existing_bus.slot} @ {new_data['nodenm']}")
+                    # if arrtime_changed:
+                    #     print(f"      arrtime: {old_arrtime}초 → {new_data['arrtime']}초")
+                    # if station_changed:
+                    #     print(f"      정류장: {old_station}개 → {new_data['arrprevstationcnt']}개")
+                # else:
+                #     # 값이 같음 → 갱신 안 함
+                #     print(f"  ➖ 유지: {existing_bus.routeid} #{existing_bus.slot}: "
+                #           f"arrtime {existing_bus.arrtime}초 (변화 없음)")
+                
+                # ============================================================
+                # ★★★ CRITICAL: last_update는 항상 갱신! ★★★
+                # ============================================================
+                # 이유: countdown 계산에 사용되므로 항상 최신 시간이어야 함!
+                # arrtime이 같아도 last_update가 갱신되어야 countdown이 정확함!
                 existing_bus.last_update = current_time
                 
                 # 메타 정보 업데이트
@@ -453,9 +545,13 @@ class BusTracker:
                     # ML 예측 수행 (딱 1회!)
                     predicted_time = self._predict_arrival_time(bus, current_time)
                     
+                    # ============================================================
+                    # ★★★ PREDICTED 모드로 전환 + 필드 업데이트 ★★★
+                    # ============================================================
                     bus.mode = BusMode.PREDICTED
                     bus.initial_arrtime = predicted_time
                     bus.prediction_time = current_time
+                    bus.arrtime = predicted_time  # ★ arrtime도 업데이트!
                     
                     self.stats['api_to_ml_transitions'] += 1
                     transitioned.append(bus)

@@ -16,11 +16,11 @@ class BusArrivalPredictor:
     버스 도착 시간 예측 모델 (성능 개선 버전)
     
     주요 개선사항:
-    1. 출퇴근 시간 세밀화 (분 단위 혼잡도)
-    2. 요일×시간 interaction 강화
-    3. 거리별 Feature 강화
-    4. 날씨×시간 interaction 개선
-    5. 하이퍼파라미터 최적화
+    1. ✅ route_based_features 활용 추가
+    2. ✅ Ensemble 가중치 CV 기반 자동화
+    3. 출퇴근 시간 세밀화 (분 단위 혼잡도)
+    4. 요일×시간 interaction 강화
+    5. 거리별 Feature 강화
     """
 
     def __init__(self, model_path: str = "models/bus_predictor.pkl"):
@@ -52,8 +52,9 @@ class BusArrivalPredictor:
         self.cv_results_ = None
         self.feature_importance_ = None
         
-        # Ensemble 여부
+        # Ensemble 여부 & 가중치
         self.use_ensemble = False
+        self.ensemble_weights_ = None  # ★ CV 기반 가중치 저장
 
     # ==================================================================
     # 1. Statistics 계산
@@ -139,36 +140,18 @@ class BusArrivalPredictor:
         return X_encoded
 
     # ==================================================================
-    # 3. Feature Interaction (개선!) ⭐⭐⭐
+    # 3. Feature Interaction (개선!)
     # ==================================================================
     def _add_feature_interactions(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Feature Interaction 추가 (개선 버전)
-        
-        주요 개선:
-        1. 출퇴근 시간 세밀화
-        2. 요일×시간 강화
-        3. 거리 카테고리 개선
-        """
+        """Feature Interaction 추가 (개선 버전)"""
         df = df.copy()
         
-        # ============================================================
-        # 개선 1: 출퇴근 시간 세밀화 (분 단위)
-        # ============================================================
+        # 출퇴근 시간 세밀화 (분 단위)
         df['time_in_minutes'] = df['hour'] * 60 + df['minute']
         
-        # 더 세밀한 러시아워 레벨 (7단계)
-        rush_bins = [
-            0,      # 00:00
-            420,    # 07:00 - 출근 시작
-            480,    # 08:00 - 출근 피크
-            540,    # 09:00 - 출근 종료
-            1020,   # 17:00 - 퇴근 시작
-            1080,   # 18:00 - 퇴근 피크
-            1140,   # 19:00 - 퇴근 종료
-            1440    # 24:00
-        ]
-        rush_labels = [0, 1, 2, 3, 4, 5, 6]  # 0=새벽, 1=출근시작, 2=출근피크, 3=오전, 4=퇴근시작, 5=퇴근피크, 6=저녁
+        # 러시아워 레벨 (7단계)
+        rush_bins = [0, 420, 480, 540, 1020, 1080, 1140, 1440]
+        rush_labels = [0, 1, 2, 3, 4, 5, 6]
         
         df['rush_level'] = pd.cut(
             df['time_in_minutes'],
@@ -177,34 +160,24 @@ class BusArrivalPredictor:
             include_lowest=True
         ).astype(int)
         
-        # 출퇴근 피크 여부 (더 정확)
+        # 출퇴근 피크 여부
         df['is_peak_rush'] = (
-            ((df['hour'] == 8) & (df['minute'] >= 0) & (df['minute'] < 30)) |  # 08:00-08:30
-            ((df['hour'] == 17) & (df['minute'] >= 30)) |                      # 17:30-18:00
-            ((df['hour'] == 18) & (df['minute'] < 30))                         # 18:00-18:30
+            ((df['hour'] == 8) & (df['minute'] >= 0) & (df['minute'] < 30)) |
+            ((df['hour'] == 17) & (df['minute'] >= 30)) |
+            ((df['hour'] == 18) & (df['minute'] < 30))
         ).astype(int)
         
-        # ============================================================
-        # 개선 2: 요일×시간 강화
-        # ============================================================
-        # 평일/주말 구분 강화
+        # 요일×시간 강화
         df['is_weekday'] = (df['day_of_week'] < 5).astype(int)
         
-        # 요일 카테고리 (월-목 / 금 / 토 / 일)
         df['weekday_category'] = df['day_of_week'].apply(
             lambda x: 'mon_thu' if x < 4 else ('fri' if x == 4 else ('sat' if x == 5 else 'sun'))
         )
         
-        # 요일×시간 interaction
         df['weekday_hour'] = df['weekday_category'] + '_H' + df['hour'].astype(str)
-        
-        # 요일×러시레벨
         df['weekday_rush'] = df['weekday_category'] + '_R' + df['rush_level'].astype(str)
         
-        # ============================================================
-        # 개선 3: 거리 카테고리 개선 (더 세밀)
-        # ============================================================
-        # 5단계 거리 구분 (기존 3단계에서 개선)
+        # 거리 카테고리 (5단계)
         distance_bins = [-np.inf, 2, 5, 10, 20, np.inf]
         distance_labels = ['very_short', 'short', 'medium', 'long', 'very_long']
         
@@ -214,10 +187,7 @@ class BusArrivalPredictor:
             labels=distance_labels
         )
         
-        # ============================================================
-        # 개선 4: 날씨×시간 interaction 개선
-        # ============================================================
-        # 온도 카테고리 (더 세밀)
+        # 온도 카테고리
         temp_bins = [-np.inf, -5, 0, 10, 20, 25, 30, np.inf]
         temp_labels = ['freezing', 'very_cold', 'cold', 'mild', 'warm', 'hot', 'very_hot']
         
@@ -227,43 +197,34 @@ class BusArrivalPredictor:
             labels=temp_labels
         )
         
-        # 날씨×러시레벨 (출퇴근 시간 날씨 영향)
+        # 날씨×러시레벨
         df['weather_rush'] = df['weather'].astype(str) + '_R' + df['rush_level'].astype(str)
         
         # 비/눈×러시레벨
         df['bad_weather'] = ((df['rain_mm'] > 0) | (df['snow_mm'] > 0)).astype(int)
         df['bad_weather_rush'] = df['bad_weather'].astype(str) + '_R' + df['rush_level'].astype(str)
         
-        # ============================================================
-        # 기존 Interaction 유지
-        # ============================================================
-        # routeid × hour
+        # 기존 Interaction
         if 'routeid' in df.columns and 'hour' in df.columns:
             df['routeid_hour'] = df['routeid'].astype(str) + '_H' + df['hour'].astype(str)
         
-        # routeid × arrprevstationcnt
         if 'routeid' in df.columns and 'arrprevstationcnt' in df.columns:
             df['routeid_station'] = df['routeid'].astype(str) + '_S' + df['arrprevstationcnt'].astype(str)
         
-        # routeid × rush_level (개선!)
         if 'routeid' in df.columns:
             df['routeid_rush'] = df['routeid'].astype(str) + '_R' + df['rush_level'].astype(str)
         
-        # vehicletp × rush_level (개선!)
         if 'vehicletp' in df.columns:
             df['vehicletp_rush'] = df['vehicletp'].astype(str) + '_R' + df['rush_level'].astype(str)
         
-        # routetp × distance_category (개선!)
         if 'routetp' in df.columns:
             df['routetp_distance'] = df['routetp'].astype(str) + '_' + df['distance_category'].astype(str)
         
-        # ============================================================
-        # 수치형 interaction (개선)
-        # ============================================================
+        # 수치형 interaction
         df['station_hour_mult'] = df['arrprevstationcnt'] * df['hour']
-        df['station_rush_mult'] = df['arrprevstationcnt'] * df['rush_level']  # 개선!
+        df['station_rush_mult'] = df['arrprevstationcnt'] * df['rush_level']
         df['station_temp_mult'] = df['arrprevstationcnt'] * df['temp']
-        df['peak_station_mult'] = df['is_peak_rush'] * df['arrprevstationcnt']  # 신규!
+        df['peak_station_mult'] = df['is_peak_rush'] * df['arrprevstationcnt']
         
         return df
 
@@ -326,25 +287,23 @@ class BusArrivalPredictor:
     # 5. Categorical Encoding (OneHot)
     # ==================================================================
     def _prepare_onehot_features(self, df: pd.DataFrame, fit: bool = False) -> pd.DataFrame:
-        """OneHot Encoding (개선된 interaction features 포함)"""
+        """OneHot Encoding"""
         df = df.copy()
         
-        # OneHot 대상 (개선!)
         onehot_cols = [
             'routetp', 'vehicletp', 'weather', 'weekday',
-            'routeid_hour', 'routeid_rush', 'vehicletp_rush',  # 개선!
-            'weather_rush', 'bad_weather_rush',  # 개선!
-            'weekday_hour', 'weekday_rush',  # 신규!
-            'routetp_distance'  # 개선!
+            'routeid_hour', 'routeid_rush', 'vehicletp_rush',
+            'weather_rush', 'bad_weather_rush',
+            'weekday_hour', 'weekday_rush',
+            'routetp_distance'
         ]
         
         available_cols = [c for c in onehot_cols if c in df.columns]
         
         if fit:
             for col in available_cols:
-                # Top-N (interaction은 더 많이)
                 if '_' in col and col not in ['routetp', 'vehicletp']:
-                    top_n = 50  # interaction은 50개
+                    top_n = 50
                 else:
                     top_n = 20
                 
@@ -384,58 +343,118 @@ class BusArrivalPredictor:
         return df
 
     # ==================================================================
-    # 6. Ensemble Model (하이퍼파라미터 개선!) ⭐
+    # 6. Ensemble Model with CV-based Weights (★ 개선!)
     # ==================================================================
-    def _create_ensemble_model(self, best_params_gbm: dict = None) -> VotingRegressor:
-        """Ensemble 모델 생성 (개선된 하이퍼파라미터)"""
+    def _create_ensemble_model(self, X, y, best_params_gbm: dict = None, verbose: bool = True) -> VotingRegressor:
+        """
+        Ensemble 모델 생성 (★★★ CV 기반 가중치 자동화! ★★★)
+        """
         
-        # GradientBoosting (개선!)
+        # ============================================================
+        # ★★★ 각 모델별 CV 수행하여 성능 측정! ★★★
+        # ============================================================
+        
+        # GradientBoosting
         if best_params_gbm:
             gbm = GradientBoostingRegressor(**best_params_gbm, random_state=42)
         else:
             gbm = GradientBoostingRegressor(
-                n_estimators=300,        # 200 → 300
-                learning_rate=0.08,      # 0.1 → 0.08 (더 천천히 학습)
-                max_depth=8,             # 7 → 8 (더 복잡한 패턴)
-                min_samples_split=15,    # 10 → 15 (과적합 방지)
-                min_samples_leaf=5,      # 4 → 5
-                subsample=0.85,          # 0.8 → 0.85
-                max_features='sqrt',     # 신규! (feature 일부만 사용)
+                n_estimators=300,
+                learning_rate=0.08,
+                max_depth=8,
+                min_samples_split=15,
+                min_samples_leaf=5,
+                subsample=0.85,
+                max_features='sqrt',
                 random_state=42
             )
         
-        # RandomForest (개선!)
+        # RandomForest
         rf = RandomForestRegressor(
-            n_estimators=300,            # 200 → 300
-            max_depth=20,                # 15 → 20 (더 깊게)
-            min_samples_split=15,        # 10 → 15
-            min_samples_leaf=5,          # 4 → 5
+            n_estimators=300,
+            max_depth=20,
+            min_samples_split=15,
+            min_samples_leaf=5,
             max_features='sqrt',
             n_jobs=-1,
             random_state=42
         )
         
-        # XGBoost (개선!)
+        # XGBoost
         xgb_model = xgb.XGBRegressor(
-            n_estimators=300,            # 200 → 300
-            learning_rate=0.08,          # 0.1 → 0.08
-            max_depth=8,                 # 7 → 8
-            min_child_weight=5,          # 4 → 5
-            subsample=0.85,              # 0.8 → 0.85
-            colsample_bytree=0.85,       # 0.8 → 0.85
-            gamma=0.1,                   # 신규! (과적합 방지)
-            reg_alpha=0.1,               # 신규! (L1 regularization)
-            reg_lambda=1.0,              # 신규! (L2 regularization)
+            n_estimators=300,
+            learning_rate=0.08,
+            max_depth=8,
+            min_child_weight=5,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             random_state=42,
             n_jobs=-1
         )
         
-        # Voting Ensemble (가중 평균으로 개선!)
+        if verbose:
+            print("\n" + "=" * 60)
+            print("개별 모델 CV 성능 측정 (가중치 계산용)")
+            print("=" * 60)
+        
+        # ============================================================
+        # ★★★ CV로 각 모델 성능 측정! ★★★
+        # ============================================================
+        models = {
+            'GradientBoosting': gbm,
+            'RandomForest': rf,
+            'XGBoost': xgb_model
+        }
+        
+        scores = {}
+        
+        for name, model in models.items():
+            cv_result = cross_validate(
+                model, X, y, cv=3,
+                scoring='neg_mean_absolute_error',
+                n_jobs=-1
+            )
+            mae = -cv_result['test_score'].mean()
+            scores[name] = mae
+            
+            if verbose:
+                print(f"{name:20s}: MAE = {mae:.2f}초 (± {cv_result['test_score'].std():.2f})")
+        
+        # ============================================================
+        # ★★★ 성능 기반 가중치 계산! ★★★
+        # ============================================================
+        # 오차가 작을수록 가중치 높게
+        # 방법: 1/MAE로 계산 후 정규화
+        
+        inv_scores = {name: 1.0 / mae for name, mae in scores.items()}
+        total_inv = sum(inv_scores.values())
+        weights = [inv_scores['GradientBoosting'] / total_inv,
+                   inv_scores['RandomForest'] / total_inv,
+                   inv_scores['XGBoost'] / total_inv]
+        
+        # 가중치 저장
+        self.ensemble_weights_ = {
+            'GradientBoosting': weights[0],
+            'RandomForest': weights[1],
+            'XGBoost': weights[2]
+        }
+        
+        if verbose:
+            print(f"\n계산된 가중치:")
+            print(f"  GradientBoosting: {weights[0]:.3f}")
+            print(f"  RandomForest:     {weights[1]:.3f}")
+            print(f"  XGBoost:          {weights[2]:.3f}")
+            print("=" * 60)
+        
+        # Voting Ensemble 생성
         ensemble = VotingRegressor([
             ('gbm', gbm),
             ('rf', rf),
             ('xgb', xgb_model)
-        ], weights=[2, 1, 2])  # GBM, XGB 가중치 높임
+        ], weights=weights)
         
         return ensemble
 
@@ -472,7 +491,7 @@ class BusArrivalPredictor:
             print("\n2. Base Features 생성...")
         df = self._add_base_features(df)
         
-        # 3. Feature Interactions (개선!)
+        # 3. Feature Interactions
         if verbose:
             print("\n3. Feature Interactions 생성 (개선!)...")
         df = self._add_feature_interactions(df)
@@ -487,7 +506,9 @@ class BusArrivalPredictor:
             print("\n5. OneHot Encoding...")
         df = self._prepare_onehot_features(df, fit=True)
         
-        # 6. Feature Columns 정의 (개선!)
+        # ============================================================
+        # ★★★ 6. Feature Columns 정의 (route_based_features 추가!) ★★★
+        # ============================================================
         numeric_features = [
             'arrprevstationcnt', 'hour', 'minute', 'day_of_week',
             'is_weekend', 'is_rush_hour', 'temp', 'humidity',
@@ -498,11 +519,19 @@ class BusArrivalPredictor:
             'route_hour_avg_time',
             'time_of_day', 'extreme_cold', 'extreme_hot',
             'rain_level', 'station_distance_category', 'bad_weather',
-            'station_hour_mult', 'station_temp_mult', 'rush_station_mult',
+            'station_hour_mult', 'station_temp_mult',
             'routeid_target_encoded', 'nodeid_target_encoded',
             # 신규 개선 Feature
             'time_in_minutes', 'rush_level', 'is_peak_rush',
-            'is_weekday', 'station_rush_mult', 'peak_station_mult'
+            'is_weekday', 'station_rush_mult', 'peak_station_mult',
+            # ============================================================
+            # ★★★ route_based_features 추가! ★★★
+            # ============================================================
+            'sec_per_station',
+            'route_avg_sec',
+            'node_avg_sec',
+            'route_hour_avg_sec',
+            'station_progress_ratio',
         ]
         
         onehot_features = []
@@ -519,7 +548,7 @@ class BusArrivalPredictor:
             print(f"  - Numeric: {len([f for f in self.feature_columns if f not in onehot_features])}")
             print(f"  - OneHot: {len([f for f in self.feature_columns if f in onehot_features])}")
             print(f"  - Target Encoded: 2 (routeid, nodeid)")
-            print(f"  - 신규 개선 Feature: 10+")
+            print(f"  - ★ route_based_features: 5개 추가!")
         
         # 7. 데이터 준비
         for col in self.feature_columns:
@@ -540,15 +569,19 @@ class BusArrivalPredictor:
             best_params = self._tune_hyperparameters(X, y, verbose)
             
             if use_ensemble:
-                self.model = self._create_ensemble_model(best_params)
+                self.model = self._create_ensemble_model(X, y, best_params, verbose)
             else:
                 self.model = GradientBoostingRegressor(**best_params, random_state=42)
         else:
             if use_ensemble:
                 if verbose:
                     print("\n" + "=" * 80)
-                    print("Ensemble 모델 생성 (개선된 하이퍼파라미터)...")
-                self.model = self._create_ensemble_model()
+                    print("Ensemble 모델 생성 (★ CV 기반 가중치 자동화!)")
+                self.model = self._create_ensemble_model(
+                    X, y,
+                    best_params_gbm=None,   # ← 여기
+                    verbose=verbose
+                )
             else:
                 self.model = GradientBoostingRegressor(
                     n_estimators=300, learning_rate=0.08, max_depth=8,
@@ -597,9 +630,9 @@ class BusArrivalPredictor:
             }).sort_values('importance', ascending=False)
             
             if verbose:
-                print(f"\nTop 15 Important Features:")
-                for _, row in self.feature_importance_.head(15).iterrows():
-                    print(f"  {row['feature']:40s}: {row['importance']:.4f}")
+                print(f"\nTop 20 Important Features:")
+                for _, row in self.feature_importance_.head(20).iterrows():
+                    print(f"  {row['feature']:45s}: {row['importance']:.4f}")
         elif use_ensemble:
             if hasattr(self.model.estimators_[0], 'feature_importances_'):
                 self.feature_importance_ = pd.DataFrame({
@@ -608,7 +641,7 @@ class BusArrivalPredictor:
                 }).sort_values('importance', ascending=False)
 
     def _tune_hyperparameters(self, X, y, verbose):
-        """Hyperparameter Tuning (개선!)"""
+        """Hyperparameter Tuning"""
         param_dist = {
             'n_estimators': [200, 250, 300, 350],
             'learning_rate': [0.05, 0.08, 0.1, 0.12],
@@ -621,7 +654,7 @@ class BusArrivalPredictor:
         
         random_search = RandomizedSearchCV(
             GradientBoostingRegressor(random_state=42),
-            param_dist, n_iter=40, cv=3,  # 30 → 40
+            param_dist, n_iter=40, cv=3,
             scoring='neg_mean_absolute_error',
             n_jobs=-1, random_state=42,
             verbose=1 if verbose else 0
@@ -719,8 +752,9 @@ class BusArrivalPredictor:
             (df2['weekday'].astype(str) == str(weekday))
         )
         
-        if hour is not None and 'hour' in df2.columns:
-            mask = mask & (df2['hour'] == hour)
+        if 'hour' not in df2.columns:
+            if 'collection_time' in df2.columns:
+                df2['hour'] = pd.to_datetime(df2['collection_time']).dt.hour
         
         matched = df2[mask]
         
@@ -773,7 +807,8 @@ class BusArrivalPredictor:
             "statistics": self.statistics,
             "feature_importance": self.feature_importance_,
             "cv_results": self.cv_results_,
-            "use_ensemble": self.use_ensemble
+            "use_ensemble": self.use_ensemble,
+            "ensemble_weights": self.ensemble_weights_  # ★ 가중치 저장!
         }, save_path)
         print(f"모델 저장 완료: {save_path}")
 
@@ -793,6 +828,12 @@ class BusArrivalPredictor:
         self.feature_importance_ = data.get('feature_importance')
         self.cv_results_ = data.get('cv_results')
         self.use_ensemble = data.get('use_ensemble', False)
+        self.ensemble_weights_ = data.get('ensemble_weights')  # ★ 가중치 로드!
 
         print(f"모델 로드 완료: {load_path}")
+        if self.ensemble_weights_:
+            print(f"  Ensemble 가중치:")
+            for name, weight in self.ensemble_weights_.items():
+                print(f"    {name}: {weight:.3f}")
+        
         return self

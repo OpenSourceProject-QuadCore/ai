@@ -77,7 +77,7 @@ class BusInfoResponse(BaseModel):
 
 
 # --------------------------------------------------------
-# 서버 시작 시 초기화 (수정됨!)
+# 서버 시작 시 초기화
 # --------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -98,33 +98,34 @@ async def startup_event():
         print("  예측 기능 없이 실행됩니다.")
         predictor = None
 
-    # 과거 데이터 로드
+    # 과거 데이터 로드 (메모리 최적화)
     processed_path = "data/processed_bus_arrivals.csv"
     
     if os.path.exists(processed_path):
         try:
-            historical_data = pd.read_csv(processed_path)
+            # ============================================================
+            # ★★★ 메모리 최적화: 필요한 컬럼만 로드! ★★★
+            # ============================================================
+            historical_data = pd.read_csv(
+                processed_path,
+                usecols=['routeid', 'nodeid', 'arrprevstationcnt', 
+                        'weekday', 'hour', 'arrtime', 'actual_arrtime']
+            )
             print(f"✓ 전처리된 데이터 로드: {processed_path}")
-            print(f"  → {len(historical_data):,} rows")
+            print(f"  → {len(historical_data):,} rows (필수 컬럼만)")
             
+            # hour 컬럼 확인
             if 'hour' not in historical_data.columns:
-                print(f"  ⚠ hour 컬럼 없음 → 생성 중...")
-                if 'collection_time' in historical_data.columns:
-                    historical_data['hour'] = pd.to_datetime(
-                        historical_data['collection_time']
-                    ).dt.hour
-                    print(f"  ✓ hour 컬럼 생성 완료")
-                else:
-                    print(f"  ⚠ collection_time 없음 → hour 조건 비활성화")
+                print(f"  ⚠ hour 컬럼 없음 → Historical pattern 비활성화")
+                historical_data = None
             
         except Exception as e:
             print(f"⚠ 전처리 데이터 로드 실패: {e}")
             historical_data = None
-    
     else:
         print(f"⚠ 전처리 데이터 없음: {processed_path}")
         print(f"  → Historical pattern fallback 비활성화")
-        print(f"  → 먼저 train_model.py를 실행하세요")  # ★ 수정됨
+        print(f"  → 먼저 train_model.py를 실행하세요")
         historical_data = None
 
     # BusTracker 초기화
@@ -146,13 +147,15 @@ async def startup_event():
 
 
 # --------------------------------------------------------
-# 백그라운드 정리 작업
+# 백그라운드 정리 작업 (에러 처리 강화)
 # --------------------------------------------------------
 async def background_cleanup_loop():
-    """주기적으로 버스 정리 작업 수행 (60초마다)"""
+    """주기적으로 버스 정리 작업 수행 (60초마다, 에러 처리 강화)"""
     await asyncio.sleep(5)
     
     cycle = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 10
     
     while True:
         if tracker is None:
@@ -170,6 +173,11 @@ async def background_cleanup_loop():
             
             tracker.cleanup()
             
+            # ============================================================
+            # ★★★ 성공 시 에러 카운터 리셋! ★★★
+            # ============================================================
+            consecutive_errors = 0
+            
             if cycle % 5 == 0:
                 stats = tracker.get_stats()
                 print(f"통계:")
@@ -181,9 +189,29 @@ async def background_cleanup_loop():
                 print(f"{'='*60}\n")
 
         except Exception as e:
-            print(f"\n❌ [{datetime.now().strftime('%H:%M:%S')}] 백그라운드 작업 오류: {e}")
+            consecutive_errors += 1
+            
+            print(f"\n❌ [{datetime.now().strftime('%H:%M:%S')}] "
+                  f"백그라운드 작업 오류 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+            
+            # ============================================================
+            # ★★★ 연속 실패 시 중지! ★★★
+            # ============================================================
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"\n🚨 치명적 오류: {max_consecutive_errors}회 연속 실패")
+                print(f"   백그라운드 정리 작업 중지")
+                break
+            
             import traceback
             traceback.print_exc()
+            
+            # ============================================================
+            # ★★★ Exponential Backoff! ★★★
+            # ============================================================
+            wait_time = min(60 * (2 ** (consecutive_errors - 1)), 600)
+            print(f"   {wait_time}초 후 재시도...")
+            await asyncio.sleep(wait_time)
+            continue
 
         await asyncio.sleep(60)
 
@@ -379,7 +407,7 @@ async def root():
         "description": "API 우선 사용, 끊기면 ML 백업 (재예측 없음)",
         "mode": "하이브리드",
         "simulation": SIMULATION_MODE,
-        "version": "6.1-fixed",
+        "version": "7.0-improved",
         "docs": "/docs",
         "endpoints": {
             "status": "/api/status",
@@ -416,6 +444,9 @@ if __name__ == "__main__":
     print("🔄 하이브리드 모드: API 우선 + ML 백업")
     print("=" * 60 + "\n")
     
+    # ============================================================
+    # ★★★ 파일명을 실제 이름과 일치시킴! ★★★
+    # ============================================================
     uvicorn.run(
         "main:app",
         host=args.host,
