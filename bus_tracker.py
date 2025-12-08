@@ -45,6 +45,15 @@ class BusInfo:
     
     tracking_id: str = ""
 
+    # trajectory용 상태
+    prev_station: Optional[int] = None
+    prev_arrtime: Optional[int] = None
+    prev_time: Optional[datetime] = None
+
+    # 실시간 속도 feature
+    sec_per_station: Optional[float] = None
+    time_elapsed: Optional[float] = None
+
     def __post_init__(self):
         if self.initial_arrtime == 0:
             self.initial_arrtime = self.arrtime
@@ -109,6 +118,9 @@ class BusTracker:
         self.simulation_mode = simulation_mode
         self.current_time = datetime.now()
         self.api_timeout_seconds = api_timeout_seconds
+        # 실시간 속도 통계 저장 (EMA)
+        self.route_speed_stats = {}   # routeid -> EMA(sec_per_station)
+        self.node_speed_stats = {}    # nodeid -> EMA(sec_per_station)
         
         # 통계
         self.stats = {
@@ -179,6 +191,53 @@ class BusTracker:
         # ============================================================
         # ★★★ 보정된 Feature로 예측 ★★★
         # ============================================================
+        stats = getattr(self.predictor, "statistics", {}) or {}
+        rt_dict = stats.get('route_sec_per_station', {})
+        nd_dict = stats.get('node_sec_per_station', {})
+        rth_dict = stats.get('route_hour_sec_per_station', {})
+        route_max_dict = stats.get('route_max_station', {})
+
+        # --- 1) sec_per_station (버스 개별) ---
+        sec_per_station = bus.sec_per_station
+
+        if sec_per_station is None:
+            r = bus.routeid
+            n = bus.nodeid
+            h = current_time.hour
+
+            # 실시간 EMA에서 먼저 찾기
+            sec_from_rt = self.route_speed_stats.get(r)
+            sec_from_nd = self.node_speed_stats.get(n)
+
+            candidates = []
+
+            if sec_from_rt is not None:
+                candidates.append(sec_from_rt)
+            if sec_from_nd is not None:
+                candidates.append(sec_from_nd)
+            if (r, h) in rth_dict:
+                candidates.append(rth_dict[(r, h)])
+            if r in rt_dict:
+                candidates.append(rt_dict[r])
+            if n in nd_dict:
+                candidates.append(nd_dict[n])
+
+            if candidates:
+                sec_per_station = float(np.median(candidates))
+            else:
+                sec_per_station = 60.0  # 최종 fallback
+
+        # --- 2) route_avg_sec / node_avg_sec / route_hour_avg_sec ---
+        route_avg_sec = rt_dict.get(bus.routeid, sec_per_station)
+        node_avg_sec = nd_dict.get(bus.nodeid, sec_per_station)
+        route_hour_avg_sec = rth_dict.get(
+            (bus.routeid, current_time.hour), route_avg_sec
+        )
+
+        # --- 3) station_progress_ratio ---
+        route_max_station = route_max_dict.get(bus.routeid, max(bus.arrprevstationcnt, 1))
+        station_progress_ratio = current_station_cnt / max(route_max_station, 1)
+        
         features = {
             "routeid": bus.routeid,
             "nodeid": bus.nodeid,
@@ -197,7 +256,12 @@ class BusTracker:
             "day_of_week": current_time.weekday(),
             "is_weekend": 1 if current_time.weekday() >= 5 else 0,
             "is_rush_hour": 1 if current_time.hour in [7,8,9,17,18,19] else 0,
-            "avg_time_per_station": avg_time_per_station
+            "avg_time_per_station": avg_time_per_station,
+            "sec_per_station": sec_per_station,
+            "route_avg_sec": route_avg_sec,
+            "node_avg_sec": node_avg_sec,
+            "route_hour_avg_sec": route_hour_avg_sec,
+            "station_progress_ratio": station_progress_ratio,
         }
 
         try:
@@ -393,10 +457,53 @@ class BusTracker:
                 existing_bus = existing_buses[exist_idx]
                 new_data = bus_list[new_idx]
                 
-                # API 모드로 복귀 (끊겼다가 다시 연결된 경우)
-                if existing_bus.mode == BusMode.PREDICTED:
-                    print(f"🔄 ML → API 복귀: {existing_bus.routeid} #{existing_bus.slot}")
-                    existing_bus.mode = BusMode.API
+                # --- 1) 이전 상태를 trajectory에 기록 ---
+                prev_time = existing_bus.last_update
+                curr_time = current_time
+                time_elapsed = (curr_time - prev_time).total_seconds()
+
+                prev_station = existing_bus.arrprevstationcnt
+                curr_station = new_data['arrprevstationcnt']
+
+                # station 감소 & 시간 정상 경과일 때만 이동으로 간주
+                if (
+                    prev_station is not None
+                    and curr_station is not None
+                    and curr_station < prev_station
+                    and time_elapsed > 0
+                    and time_elapsed < 3600  # 과도한 gap 방지 (preprocessor와 동일)
+                ):
+                    station_delta = max(prev_station - curr_station, 1)
+                    sec_per_station = time_elapsed / station_delta
+
+                    # 비현실적인 속도 필터
+                    if 5 <= sec_per_station <= 600:
+                        existing_bus.sec_per_station = sec_per_station
+                        existing_bus.time_elapsed = time_elapsed
+                    else:
+                        # 이상치면 그냥 무시
+                        existing_bus.sec_per_station = None
+                        existing_bus.time_elapsed = None
+
+                # --- 실시간 route/node 속도 EMA 업데이트 ---
+                if existing_bus.sec_per_station is not None:
+                    r = existing_bus.routeid
+                    n = existing_bus.nodeid
+                    s = existing_bus.sec_per_station
+
+                    alpha = 0.2  # EMA 계수
+
+                    prev_r = self.route_speed_stats.get(r)
+                    if prev_r is None:
+                        self.route_speed_stats[r] = s
+                    else:
+                        self.route_speed_stats[r] = (1 - alpha) * prev_r + alpha * s
+
+                    prev_n = self.node_speed_stats.get(n)
+                    if prev_n is None:
+                        self.node_speed_stats[n] = s
+                    else:
+                        self.node_speed_stats[n] = (1 - alpha) * prev_n + alpha * s
                 
                 # ============================================================
                 # ★★★ arrtime 또는 arrprevstationcnt가 변경되었는지 확인 ★★★

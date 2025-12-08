@@ -96,6 +96,39 @@ def main():
         use_cv=args.cv,
         use_ensemble=args.ensemble
     )
+
+    # 1) route별 평균 sec_per_station
+    predictor.statistics['route_sec_per_station'] = (
+        processed_df.groupby('routeid')['sec_per_station']
+        .mean()
+        .dropna()
+        .to_dict()
+    )
+
+    # 2) node별 평균 sec_per_station
+    predictor.statistics['node_sec_per_station'] = (
+        processed_df.groupby('nodeid')['sec_per_station']
+        .mean()
+        .dropna()
+        .to_dict()
+    )
+
+    # 3) route + hour 평균 sec_per_station
+    route_hour = (
+        processed_df.groupby(['routeid', 'hour'])['sec_per_station']
+        .mean()
+        .dropna()
+    )
+    predictor.statistics['route_hour_sec_per_station'] = {
+        (r, int(h)): v for (r, h), v in route_hour.items()
+    }
+
+    # 4) route별 max_station_route (station_progress_ratio 계산용)
+    predictor.statistics['route_max_station'] = (
+        processed_df.groupby('routeid')['arrprevstationcnt']
+        .max()
+        .to_dict()
+    )
     
     # ============================================================
     # 3. 모델 저장
