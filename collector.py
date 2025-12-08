@@ -10,8 +10,8 @@ SERVER_URL = "http://localhost:8000/api/bus-arrival/batch"
 # ==============================
 # 1) 사용자 설정
 # ==============================
-SERVICE_KEY = "a1a05716a1d9f1f95f6fd8787212782eaebe2b75ed10dca127e0604041e591c8"
-KMA_API_KEY = "a1a05716a1d9f1f95f6fd8787212782eaebe2b75ed10dca127e0604041e591c8"
+SERVICE_KEY = "YOUR_CODE"
+KMA_API_KEY = "YOUR_CODE"
 
 CITY_CODE = "37050"
 LOOP_INTERVAL_SECONDS = 60
@@ -57,7 +57,7 @@ def append_to_csv(data_list, file_name, header, extra_info):
         print(f"[CSV ERROR] {e}")
 
 def send_to_server(data_list, extra_info):
-    """서버로 데이터 전송"""
+    """서버로 데이터 전송 (API 버그 자동 보정 포함)"""
     if not data_list:
         return
     
@@ -65,17 +65,104 @@ def send_to_server(data_list, extra_info):
         server_data = []
         now = now_kst().isoformat()
         skipped = 0
+        invalid_arrtime_count = 0
+        auto_corrected_count = 0  # 자동 보정 카운터
         
         for row in data_list:
-            if 'arrtime' not in row or row.get('arrtime') is None or row.get('arrtime') == '':
+            # ============================================================
+            # ★★★ STEP 1: arrtime 안전하게 파싱 ★★★
+            # ============================================================
+            raw_arrtime = row.get('arrtime')
+            
+            # 1-1. arrtime 없으면 스킵
+            if raw_arrtime is None or raw_arrtime == '':
                 skipped += 1
                 continue
             
+            # 1-2. 안전한 정수 변환
+            try:
+                # 문자열이면 숫자만 추출
+                if isinstance(raw_arrtime, str):
+                    # "1234초", "1,234" → "1234"
+                    cleaned = ''.join(c for c in raw_arrtime if c.isdigit() or c == '-')
+                    if not cleaned:
+                        print(f"  ⚠️  arrtime 파싱 실패: '{raw_arrtime}' "
+                              f"(노선: {row.get('routeno')}, 정류장: {row.get('nodenm')})")
+                        invalid_arrtime_count += 1
+                        continue
+                    arrtime = int(cleaned)
+                else:
+                    # 숫자면 그냥 int 변환
+                    arrtime = int(raw_arrtime)
+                
+            except (ValueError, TypeError) as e:
+                print(f"  ⚠️  arrtime 변환 실패: '{raw_arrtime}' → {e} "
+                      f"(노선: {row.get('routeno')}, 정류장: {row.get('nodenm')})")
+                invalid_arrtime_count += 1
+                continue
+            
+            # ============================================================
+            # ★★★ STEP 2: arrprevstationcnt 파싱 ★★★
+            # ============================================================
+            try:
+                arrprevstationcnt = int(row.get('arrprevstationcnt', 0))
+            except (ValueError, TypeError):
+                arrprevstationcnt = 0
+            
+            # ============================================================
+            # ★★★ STEP 3: API 버그 자동 감지 및 보정 ★★★
+            # ============================================================
+            original_arrtime = arrtime  # 보정 전 값 저장
+            
+            # 정류장 수가 5개 이상이고, arrtime이 있을 때만 검증
+            if arrprevstationcnt >= 5 and arrtime > 0:
+                sec_per_station = arrtime / arrprevstationcnt
+                
+                # ============================================================
+                # ★ 휴리스틱: 정류장당 10초 미만이면 마지막 자리 누락 의심!
+                # ============================================================
+                if sec_per_station < 10:
+                    # 10배 보정 시도
+                    corrected_arrtime = arrtime * 10
+                    corrected_sec_per_station = corrected_arrtime / arrprevstationcnt
+                    
+                    # 보정 후 10~600초 범위면 적용
+                    if 10 <= corrected_sec_per_station <= 600:
+                        print(f"  🔧 [자동 보정] 노선 {row.get('routeno')}, "
+                              f"정류장 {arrprevstationcnt}개: "
+                              f"{arrtime}초 → {corrected_arrtime}초 "
+                              f"(정류장당 {sec_per_station:.1f}초 → {corrected_sec_per_station:.1f}초)")
+                        arrtime = corrected_arrtime
+                        auto_corrected_count += 1
+                    else:
+                        # 10배 해도 이상하면 경고만
+                        print(f"  ⚠️  의심스러운 arrtime: 노선 {row.get('routeno')}, "
+                              f"정류장 {arrprevstationcnt}개, "
+                              f"arrtime {arrtime}초 (정류장당 {sec_per_station:.1f}초)")
+            
+            # ============================================================
+            # ★★★ STEP 4: arrtime 검증 ★★★
+            # ============================================================
+            # 4-1. 범위 체크 (0-7200초 = 0-2시간)
+            if arrtime < 0:
+                print(f"  ⚠️  음수 arrtime 감지: {arrtime}초 → 스킵 "
+                      f"(노선: {row.get('routeno')}, 정류장: {row.get('nodenm')})")
+                invalid_arrtime_count += 1
+                continue
+            
+            if arrtime > 7200:
+                print(f"  ⚠️  비현실적 arrtime: {arrtime}초 ({arrtime/60:.1f}분) → 스킵 "
+                      f"(노선: {row.get('routeno')}, 정류장: {row.get('nodenm')})")
+                invalid_arrtime_count += 1
+                continue
+            
+            # ============================================================
+            # ★★★ STEP 5: 데이터 준비 ★★★
+            # ============================================================
             row_copy = row.copy()
             row_copy['collection_time'] = now
             row_copy.update(extra_info)
             
-            # ★★★ 모든 필드 기본값 보장 ★★★
             # 날씨 문자열
             row_copy['weather'] = str(row_copy.get('weather') or 'Unknown')
             
@@ -91,13 +178,21 @@ def send_to_server(data_list, extra_info):
                 row_copy[field] = str(row_copy.get(field) or '')
             
             # 정수 필드
-            row_copy['arrprevstationcnt'] = int(row_copy.get('arrprevstationcnt', 0))
-            row_copy['arrtime'] = int(row_copy.get('arrtime', 0))
+            row_copy['arrprevstationcnt'] = arrprevstationcnt
+            row_copy['arrtime'] = arrtime  # ★ 보정된 값 사용!
             
             server_data.append(row_copy)
         
+        # ============================================================
+        # ★★★ STEP 6: 전송 및 통계 ★★★
+        # ============================================================
         if not server_data:
-            print(f"  ⚠️  전송할 데이터 없음 (모두 arrtime 누락)")
+            msg = f"  ⚠️  전송할 데이터 없음"
+            if skipped > 0:
+                msg += f" (arrtime 누락: {skipped}개)"
+            if invalid_arrtime_count > 0:
+                msg += f" (arrtime 오류: {invalid_arrtime_count}개)"
+            print(msg)
             return
         
         # 전송
@@ -110,8 +205,19 @@ def send_to_server(data_list, extra_info):
         if response.status_code == 200:
             result = response.json()
             msg = f"  ✓ 서버 전송: {len(server_data)}개"
+            
+            # 통계 추가
+            stats_parts = []
+            if auto_corrected_count > 0:
+                stats_parts.append(f"자동 보정 {auto_corrected_count}개")
             if skipped > 0:
-                msg += f" (arrtime 없는 {skipped}개 제외)"
+                stats_parts.append(f"누락 {skipped}개")
+            if invalid_arrtime_count > 0:
+                stats_parts.append(f"오류 {invalid_arrtime_count}개")
+            
+            if stats_parts:
+                msg += f" ({', '.join(stats_parts)})"
+            
             msg += f" → {result.get('message', 'OK')}"
             print(msg)
         elif response.status_code == 422:
@@ -198,10 +304,9 @@ def get_kma_current():
         res = requests.get(url, params=params, timeout=15)
         print("📡 [DEBUG] CURRENT URL:", res.url)
         print("📄 [DEBUG] CURRENT RAW:", res.text[:200])
-        js = res.json()  # 여기서 json 파싱 (오류 발생하면 원인 확인 가능)
+        js = res.json()
 
         items = js['response']['body']['items']['item']
-
 
         temp = hum = rain = snow = None
         weather = None
@@ -249,7 +354,6 @@ def get_kma_forecast():
         js = res.json()
 
         items = js['response']['body']['items']['item']
-
 
         temp = hum = rain = snow = None
         weather = None
@@ -362,7 +466,10 @@ def get_arrival_data(node_id):
 # 6) 메인 루프
 # =========================
 def main():
+    print("=" * 60)
     print("=== 구미 버스 + 기상청 통합 수집 시작 ===")
+    print("=== arrtime 자동 보정 기능 활성화 ===")
+    print("=" * 60)
 
     while True:
         start = time.time()
