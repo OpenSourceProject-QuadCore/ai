@@ -292,10 +292,10 @@ class BusArrivalPredictor:
         
         onehot_cols = [
             'routetp', 'vehicletp', 'weather', 'weekday',
-            'routeid_hour', 'routeid_rush', 'vehicletp_rush',
-            'weather_rush', 'bad_weather_rush',
-            'weekday_hour', 'weekday_rush',
-            'routetp_distance'
+            # 'routeid_hour', 'routeid_rush', 'vehicletp_rush',
+            # 'weather_rush', 'bad_weather_rush',
+            # 'weekday_hour', 'weekday_rush',
+            # 'routetp_distance'
         ]
         
         available_cols = [c for c in onehot_cols if c in df.columns]
@@ -809,7 +809,7 @@ class BusArrivalPredictor:
             "cv_results": self.cv_results_,
             "use_ensemble": self.use_ensemble,
             "ensemble_weights": self.ensemble_weights_  # ★ 가중치 저장!
-        }, save_path)
+        }, save_path, compress=3)
         print(f"모델 저장 완료: {save_path}")
 
     def load(self, path: Optional[str] = None) -> 'BusArrivalPredictor':
